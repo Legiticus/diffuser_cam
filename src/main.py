@@ -10,10 +10,20 @@ picam2 = Picamera2()
 
 # Configure camera stream (1280x800 is native 1MP resolution for OV9281)
 config = picam2.create_video_configuration(
-    main={"size": (1280, 800), "format": "XRGB8888"}
+    main={"size": (1280, 800), "format": "SBGGR10"}
 )
 picam2.configure(config)
 picam2.start()
+
+picam2.set_controls({
+    "AeEnable": False,
+    "AwbEnable": False,
+    "ExposureTime": 5000,
+    "AnalogGain": 1.0,
+    "ColourGains": (1.0, 1.0)
+})
+
+time.sleep(1)
 
 def generate_frames():
     while True:
