@@ -1,0 +1,120 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PSF Viewer</title>
+<style>
+ :root{--bg:#111;--card:#1c1c1c;--fg:#ddd;--mute:#888;--acc:#4fc3f7;--warn:#ffb74d}
+ *{box-sizing:border-box} body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:12px}
+ h3{margin:4px 0 10px} .row{display:flex;flex-wrap:wrap;gap:12px}
+ .card{background:var(--card);padding:10px;border-radius:6px;min-width:0}
+ img{max-width:100%;display:block;background:#000}
+ label{font-size:13px;color:var(--mute)} input[type=number]{width:80px;background:#000;color:var(--fg);border:1px solid #333;padding:3px}
+ input[type=range]{width:100%} .ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:6px 0}
+ .pick{position:relative;cursor:crosshair} .pick canvas{position:absolute;left:0;top:0;width:100%;height:100%}
+ table{border-collapse:collapse;font-size:13px;width:100%} td{padding:3px 6px;border-bottom:1px solid #2a2a2a;vertical-align:top}
+ td:first-child{color:var(--mute);white-space:nowrap} .warn{color:var(--warn)} .small{font-size:12px;color:var(--mute)}
+ .caps{display:flex;flex-wrap:wrap;gap:6px} .caps button{background:#000;color:var(--fg);border:1px solid #333;padding:4px 8px;border-radius:4px;cursor:pointer}
+ .caps button.on{border-color:var(--acc);color:var(--acc)}
+</style></head><body>
+<h3>DiffuserCam PSF viewer</h3>
+<div class="small" id="run"></div>
+<div class="row" style="margin-top:8px">
+ <div class="card" style="flex:1 1 420px">
+  <b>1. Choose a point</b>
+  <div class="small">Object plane at depth d. Click to place the point. Colour = fraction of the PSF that lands on the sensor (yellow = all of it).</div>
+  <div class="pick" id="pick"><img id="fov" alt="field of view map"><canvas id="cv"></canvas></div>
+  <div class="ctl">
+   <label>x (mm) <input type="number" id="x" step="0.1" value="0"></label>
+   <label>y (mm) <input type="number" id="y" step="0.1" value="0"></label>
+   <label>d (mm) <input type="number" id="dn" step="0.1"></label>
+  </div>
+  <input type="range" id="d" step="0.1" aria-label="depth">
+  <div class="small" id="drange"></div>
+  <div class="ctl">
+   <label>t (mm) <input type="number" id="t" step="0.01"></label>
+   <span class="small" id="test"></span>
+  </div>
+  <div class="small">Captured depths (click to jump):</div>
+  <div class="caps" id="caps"></div>
+ </div>
+ <div class="card" style="flex:1.4 1 520px">
+  <b>2. Predicted sensor image</b>
+  <div class="ctl">
+   <label><input type="checkbox" id="gam" checked> sqrt stretch</label>
+   <label><input type="checkbox" id="cmp"> show nearest captured PSF instead</label>
+   <a id="dl" href="#" style="color:var(--acc);font-size:13px">download .npy</a>
+  </div>
+  <img id="pred" alt="predicted PSF">
+  <div class="small">Blue-tinted area: comes from outside the captured sensor area, so its contents are unknown.</div>
+  <table id="info" style="margin-top:8px"></table>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let info=null, ext={x:1,y:1}, timer=null;
+const q=()=>{const p=new URLSearchParams({x:$('x').value||0,y:$('y').value||0,d:$('dn').value,t:$('t').value});return p.toString()};
+const f=(v,n=3)=>v==null?'–':(+v).toFixed(n);
+
+async function init(){
+ info=await (await fetch('api/info')).json();
+ $('run').textContent='Run: '+info.run_dir+'  ·  pixel pitch '+info.pixel_pitch_um+' µm';
+ const [lo,hi]=info.depth_range;
+ $('d').min=lo;$('d').max=hi;$('d').value=lo;$('dn').value=lo;
+ $('drange').textContent=`captured range ${lo.toFixed(1)} – ${hi.toFixed(1)} mm (outside it the depth is extrapolated)`;
+ $('t').value=info.t_mm.toFixed(3);
+ const e=info.t_estimate;
+ $('test').innerHTML=e.t_mm!=null?`estimated from run: ${e.t_mm.toFixed(3)} mm <span class="${e.note==='ok'?'':'warn'}">(${e.note})</span>`:e.note;
+ $('caps').innerHTML='';
+ info.captures.forEach(c=>{const b=document.createElement('button');b.textContent=c.distance_mm.toFixed(1);
+  b.title=c.file+(c.warnings.length?' – '+c.warnings.join('; '):'');if(c.warnings.length)b.classList.add('warn');
+  b.onclick=()=>{$('dn').value=c.distance_mm;$('d').value=c.distance_mm;update(true)};$('caps').appendChild(b)});
+ update(true);
+}
+
+function drawCross(){
+ const cv=$('cv'),img=$('fov');cv.width=img.clientWidth;cv.height=img.clientHeight;
+ const g=cv.getContext('2d'),W=cv.width,H=cv.height;
+ g.clearRect(0,0,W,H);g.strokeStyle='rgba(255,255,255,.25)';g.beginPath();g.moveTo(W/2,0);g.lineTo(W/2,H);g.moveTo(0,H/2);g.lineTo(W,H/2);g.stroke();
+ const px=(+$('x').value/ext.x+1)/2*W, py=(+$('y').value/ext.y+1)/2*H;
+ g.strokeStyle='#f44';g.lineWidth=2;g.beginPath();g.arc(px,py,7,0,7);g.moveTo(px-12,py);g.lineTo(px+12,py);g.moveTo(px,py-12);g.lineTo(px,py+12);g.stroke();
+ g.fillStyle='rgba(255,255,255,.7)';g.font='11px system-ui';g.fillText(`±${ext.x.toFixed(1)} × ±${ext.y.toFixed(1)} mm`,6,14);
+}
+
+async function update(fovToo){
+ clearTimeout(timer);
+ timer=setTimeout(async()=>{
+  const qs=q();
+  if(fovToo){
+   const r=await fetch('api/fov.json?'+qs);if(r.ok){const j=await r.json();ext={x:j.x_max_mm,y:j.y_max_mm}}
+   $('fov').src='api/fov.png?'+qs;
+  }
+  drawCross();
+  const r=await fetch('api/predict.json?'+qs),j=await r.json();
+  if(!r.ok){$('info').innerHTML=`<tr><td class="warn">error</td><td class="warn">${j.error}</td></tr>`;return}
+  const gam=$('gam').checked?0.5:1;
+  $('pred').src=$('cmp').checked?`api/captured/${j.nearest_capture.index}.png?gamma=${gam}`:`api/predict.png?${qs}&gamma=${gam}`;
+  $('dl').href='api/predict.npy?'+qs;
+  const n=j.nearest_capture, rows=[
+   ['point',`x=${f(j.x_mm,2)}, y=${f(j.y_mm,2)} mm at d=${f(j.d_mm,2)} mm (${f(j.z_from_diffuser_mm,2)} mm from diffuser)`],
+   ['based on capture',`#${n.index} at ${f(n.distance_mm,2)} mm${n.dark_subtracted?'':' <span class="warn">(no dark frame)</span>'}${n.warnings.length?' <span class="warn">'+n.warnings.join('; ')+'</span>':''}`],
+   ['scale vs capture',`${f(j.scale_from_capture,4)} (magnification ${f(j.magnification,4)})`],
+   ['shift on sensor',`${f(j.shift_px[0],1)}, ${f(j.shift_px[1],1)} px`],
+   ['PSF light on sensor',`${f(100*j.captured_energy_on_sensor,1)} %`],
+   ['unknown area',`${f(100*j.unknown_area_frac,1)} %`],
+   ['peak',`${f(j.peak_counts_per_us,4)} counts/µs → ~${j.exposure_for_75pct_us?Math.round(j.exposure_for_75pct_us):'–'} µs for 75% full scale`],
+  ];
+  if(j.extrapolated_depth)rows.push(['note','<span class="warn">depth outside the captured range (extrapolated)</span>']);
+  $('info').innerHTML=rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+ },60);
+}
+
+$('pick').addEventListener('click',e=>{const r=$('fov').getBoundingClientRect();
+ $('x').value=((((e.clientX-r.left)/r.width)*2-1)*ext.x).toFixed(2);
+ $('y').value=((((e.clientY-r.top)/r.height)*2-1)*ext.y).toFixed(2);update(false)});
+$('d').addEventListener('input',()=>{$('dn').value=$('d').value;update(true)});
+$('dn').addEventListener('change',()=>{$('d').value=$('dn').value;update(true)});
+['x','y'].forEach(k=>$(k).addEventListener('change',()=>update(false)));
+$('t').addEventListener('change',()=>update(true));
+['gam','cmp'].forEach(k=>$(k).addEventListener('change',()=>update(false)));
+$('fov').addEventListener('load',drawCross);window.addEventListener('resize',drawCross);
+init();
+</script></body></html>
