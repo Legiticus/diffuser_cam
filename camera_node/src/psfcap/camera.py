@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .constants import SENSOR_SIZE
+from .constants import GAIN, SENSOR_SIZE
 
 log = logging.getLogger(__name__)
 
@@ -20,14 +20,13 @@ class Frame:
     raw: np.ndarray          # uint16 (h, w), 0..1023
     timestamp_ns: int        # SensorTimestamp, CLOCK_MONOTONIC
     exposure_us: int
-    gain: float
 
 
 class Camera:
     """Owns the Picamera2 instance. A background thread keeps grabbing raw frames;
     the web stream reads the latest one and the sweep waits for qualifying ones."""
 
-    def __init__(self, gain: float, exposure_us: int):
+    def __init__(self, exposure_us: int):
         from picamera2 import Picamera2
         self.picam2 = Picamera2()
         cfg = self.picam2.create_video_configuration(
@@ -36,14 +35,13 @@ class Camera:
             buffer_count=4,
             controls=self._exposure_controls(exposure_us) | {
                 "AeEnable": False,
-                "AnalogueGain": float(gain),
+                "AnalogueGain": GAIN,
                 "NoiseReductionMode": 0,
             },
         )
         self.picam2.configure(cfg)
         self.raw_cfg = self.picam2.camera_configuration()["raw"]
         self.requested_exposure = exposure_us
-        self.gain = gain
         self._cond = threading.Condition()
         self._latest: Frame | None = None
         self._seq = 0
@@ -89,7 +87,7 @@ class Camera:
             with self._cond:
                 self._seq += 1
                 self._latest = Frame(self._seq, raw, int(md.get("SensorTimestamp", time.monotonic_ns())),
-                                     int(md.get("ExposureTime", 0)), float(md.get("AnalogueGain", 0.0)))
+                                     int(md.get("ExposureTime", 0)))
                 self._cond.notify_all()
 
     def latest(self) -> Frame | None:
@@ -110,13 +108,12 @@ class Camera:
         # The sensor quantises exposure to whole line times (~9 us).
         return abs(actual - requested) <= max(0.02 * requested, 20)
 
-    def grab(self, n: int, not_before_ns: int, timeout: float | None = None) -> list[Frame]:
+    def grab(self, n: int, not_before_ns: int) -> list[Frame]:
         """Return n consecutive new frames that started after `not_before_ns` and
         were taken with the currently requested exposure."""
         req = self.requested_exposure
         frame_s = max(0.0333, req / 1e6)
-        timeout = timeout or (5.0 + (n + 12) * frame_s * 1.5)
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + 5.0 + (n + 12) * frame_s * 1.5
         out: list[Frame] = []
         seq = self.latest().seq if self.latest() else 0
         while len(out) < n:
