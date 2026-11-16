@@ -1,51 +1,35 @@
 #include <Arduino.h>
 #include <AccelStepper.h>
-
-#define DIR_PIN 8
-#define STEP_PIN 7
-#define SENSE_PIN 2
-
-#define LIMIT_ON 0
-
-#define DIR_UP -1
-#define DIR_DOWN 1
-
-const int MICROSTEP_DIVIDER = 8;
-const int STEPS_PER_REV_MOTOR = 400; // 0.9 degrees per full step
-const int STEPS_PER_REV_ACTUAL = STEPS_PER_REV_MOTOR * MICROSTEP_DIVIDER;
-const int MM_PER_REV = 2;
-const int STEPS_PER_MM = STEPS_PER_REV_ACTUAL / MM_PER_REV;
-
-const int MAX_RPM = 120; // Corresponds to 16 mm/s
-const int MAX_SPEED = (MAX_RPM / 60.0) * STEPS_PER_REV_ACTUAL;
-const int MAX_ACCL = MAX_SPEED;
-
-AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
-
-const int MOVE_STEP = 0.1;
+#include <LiquidCrystal.h>
+#include "PinMap.h"
 
 // Zeros the position of the motor
 void zeroPosition();
 
 // Checks if the limit has been triggered
-bool limitTriggered();
+bool limitTriggered(int pin);
+
+// Initialize stepper motor and LCD display
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+LiquidCrystal lcd(RS,EN,D4,D5,D6,D7);
 
 void setup() {
   Serial.begin(115200);
   Serial.setTimeout(1000);
 
-  pinMode(SENSE_PIN, INPUT);
+	pinMode(STEP_PIN, OUTPUT);
+	pinMode(DIR_PIN, OUTPUT);
+	pinMode(EN_PIN, OUTPUT);
+	pinMode(FRONT_LIMIT, INPUT_PULLUP);
+	pinMode(BACK_LIMIT, INPUT_PULLUP);
+
+	digitalWrite(EN_PIN, HIGH);
+	digitalWrite(STEP_PIN, LOW);
+	digitalWrite(DIR_PIN, STEPPER_FORWARD);
 
   stepper.setMaxSpeed(MAX_SPEED);
   stepper.setAcceleration(MAX_ACCL);
 
-  // Check if values divide nicely (errors is movement may occur otherwise)
-  if (STEPS_PER_REV_ACTUAL % MM_PER_REV != 0) Serial.println("WARNING - STEPS_PER_MM is only approximate due to integer division!");
-  if (STEPS_PER_MM % 100 != 0) Serial.println("WARNING - STEPS_PER_MM is not divisible by 100 which may lead to errors in zeroing the scanner head!");
-
-  //Serial.println("DEBUG - Zeroing scanner assembly");
-  //zeroPosition();
-  //Serial.println("DEBUG - Zeroing Complete");
 }
 
 void loop() {
@@ -74,19 +58,25 @@ void loop() {
 
         bool success = true;
         float arg_val = atof(arg);
-        stepper.move(DIR_UP * STEPS_PER_MM * arg_val);
+        stepper.move(STEPPER_FORWARD * STEPS_PER_MM * arg_val);
         
         // Run motor until position checking for limit switch
         while (stepper.currentPosition() != stepper.targetPosition()) {
           // Run one step
           stepper.run();
           // Check if limit switch triggered
-          if (limitTriggered()) {
-            Serial.println("MOVE_FAIL - Limit Triggered");
+          if (limitTriggered(BACK_LIMIT)) {
+            Serial.println("MOVE_FAIL - Back Limit Triggered");
+            success = false;
+            break;
+          }
+          else if (limitTriggered(FRONT_LIMIT)) {
+            Serial.println("MOVE_FAIL - Front Limit Triggered");
             success = false;
             break;
           }
         }
+
         // Print return msg
         if (success) Serial.println("MOVE_SUCCESS");
 
@@ -103,13 +93,14 @@ void loop() {
 void zeroPosition() {
   
   /*
-   * Phase 1: Move DOWN until limit triggered
+   * Phase 1: Move FORWARD until limit triggered
   */
 
-  // Move to an arbitrary large number of steps DOWN
-  stepper.moveTo(DIR_DOWN * 100000);
-  while (!limitTriggered()) {
+  // Move to an arbitrary large number of steps FORWARD
+  stepper.moveTo(STEPPER_FORWARD * 10000000);
+  while (!limitTriggered(FRONT_LIMIT)) {
     stepper.run();
+    delay(1);
   }
   stepper.stop(); // Stop the stepper motor
   stepper.moveTo(stepper.currentPosition()); // Set target to current position
@@ -118,25 +109,26 @@ void zeroPosition() {
    * Phase 2: Raise UP until limit not triggered one mm at a time
   */
 
-  while (limitTriggered()) {
-    stepper.move(DIR_UP * STEPS_PER_MM * 1); //move 1 mm at a time
+  while (limitTriggered(FRONT_LIMIT)) {
+    stepper.move(STEPPER_BACKWARD * STEPS_PER_MM * 1); //move 1 mm at a time
     stepper.runToPosition();
+    delay(1);
   }
 
   /*
    * Phase 3: Move DOWN until limit triggered one tenth of a mm at a time
   */
 
-  while (!limitTriggered()) {
-    stepper.move(DIR_DOWN * STEPS_PER_MM * 0.1); //move 0.1 mm at a time
+  while (!limitTriggered(FRONT_LIMIT)) {
+    stepper.move(STEPPER_FORWARD * STEPS_PER_MM * 0.1); //move 0.1 mm at a time
     stepper.runToPosition();
   }
 
   /*
    * Phase 4: Move up to be right above limit
   */
-  while (limitTriggered()) {
-    stepper.move(DIR_UP * STEPS_PER_MM * 0.01);
+  while (limitTriggered(FRONT_LIMIT)) {
+    stepper.move(STEPPER_BACKWARD * STEPS_PER_MM * 0.01);
     stepper.runToPosition();
   }
 
@@ -147,6 +139,6 @@ void zeroPosition() {
 
 }
 
-bool limitTriggered() {
-  return digitalRead(SENSE_PIN) == LIMIT_ON;
+bool limitTriggered(int pin) {
+  return (digitalRead(pin) == LOW);
 }
