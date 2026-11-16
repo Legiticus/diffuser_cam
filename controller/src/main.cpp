@@ -100,10 +100,8 @@ void zeroPosition() {
   stepper.moveTo(STEPPER_FORWARD * 10000000);
   while (!limitTriggered(FRONT_LIMIT)) {
     stepper.run();
-    delay(1);
   }
-  stepper.stop(); // Stop the stepper motor
-  stepper.moveTo(stepper.currentPosition()); // Set target to current position
+  stepper.setCurrentPosition(stepper.currentPosition()); // Set target to current position
 
   /*
    * Phase 2: Raise UP until limit not triggered one mm at a time
@@ -112,7 +110,6 @@ void zeroPosition() {
   while (limitTriggered(FRONT_LIMIT)) {
     stepper.move(STEPPER_BACKWARD * STEPS_PER_MM * 1); //move 1 mm at a time
     stepper.runToPosition();
-    delay(1);
   }
 
   /*
