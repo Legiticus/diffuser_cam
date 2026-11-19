@@ -1,40 +1,39 @@
 """
-Predicts the sensor PSF for a point anywhere in front of the camera, from a
-psf_capture depth sweep (an on-axis point source captured at a series of depths).
+Forward model that predicts the sensor PSF for any point, from a PSF capture run.
 
-Geometry (DiffuserCam, Antipa et al.): the diffuser sits t in front of the sensor;
-a point at source-to-sensor distance d is z = d - t from the diffuser.
+DiffuserCam model (Antipa et al., "DiffuserCam: lensless single-exposure 3D imaging"):
 
-  * Depth: the caustic pattern is magnified by M(d) = d / (d - t) about a fixed
-    point on the sensor, the scale centre (where the source axis meets the sensor).
-  * Lateral: moving the point sideways by (x, y) mm translates the pattern on the
-    sensor by -(t / z) * (x, y).
+  * A diffuser sits a distance t in front of the sensor. A point source at
+    source-to-sensor distance d is z = d - t from the diffuser.
+  * Lateral shift invariance: moving the point sideways by (x, y) translates the
+    caustic pattern on the sensor by  -(t / z) * (x, y).
+  * Depth scaling: the caustic pattern is magnified by  M(d) = d / (d - t)
+    (1 + t/z) about the point's projection on the sensor. The light collected
+    falls off as 1/z^2.
 
-Prediction for (x, y, d):
-  1. take the two captures that bracket d (in 1/d; the nearest end capture when d is
-     outside the captured range),
-  2. scale each by M(d) / M(d_i) about the scale centre and blend them, weighted
-     linearly in 1/d (the fine speckle changes with depth, not only its scale),
-  3. set the total brightness from a smooth fit of captured energy vs depth (real
-     runs don't follow an ideal 1/z^2 law), falling back to 1/z^2 outside the range,
-  4. translate by -(t / z) * (x, y) / pixel_pitch.
+Prediction for a point (x, y, d):
+  1. take the captured PSF whose depth is closest in 1/d,
+  2. dark-subtract it and divide by exposure (counts per microsecond),
+  3. scale it by M(d) / M(d_i) about its centroid (energy conserving, times the
+     (z_i / z)^2 brightness change),
+  4. translate it by -(t / z) * (x, y) / pixel_pitch.
 
-Parts of the prediction that come from outside the captured sensor area are unknown:
-they're flagged in a mask, never invented.
+Regions of the prediction that come from outside the captured sensor area are
+unknown and are reported as such (mask), never invented.
 
-t and the scale centre are estimated from the run: a few PSFs are compared with the
-nearest one to measure their relative scale and offset (FFT cross-correlation), t is
-fitted to the scale-vs-depth model, and the centre to the offsets. If t is known from
-the build it can be given instead.
+t is estimated from the run itself: every PSF is compared to the nearest one to
+measure their relative scale (FFT cross-correlation over a range of scales, which
+is insensitive to translation), and t is fitted to the scale-vs-depth model. If
+you know t from the build, pass it explicitly; it's more accurate.
 
-Object coordinates (x, y) are in mm along the sensor's column (x) and row (y)
-directions, measured from the axis the light source travelled along.
+Object coordinates (x, y) are in mm, measured along the sensor's column (x) and
+row (y) directions from the axis the light source travelled along.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -48,60 +47,39 @@ SENSOR_MAX = 1023
 # Loading
 # --------------------------------------------------------------------------- #
 @dataclass
-class Capture:
+class CapturedPsf:
     index: int
     distance_mm: float
     file: str
-    dark_file: str | None
     exposure_us: float
-    image: np.ndarray          # float32 counts/us, background-subtracted (not clipped at 0:
-                               # clipping noise would bias the energy upward)
+    image: np.ndarray          # float32, dark-subtracted, counts per microsecond (unclipped:
+                               # clipping noise at 0 would bias the energy upward)
+    centroid: tuple[float, float]
     dark_subtracted: bool
     warnings: list = field(default_factory=list)
 
-    @property
-    def energy(self) -> float:
-        return float(self.image.sum(dtype=np.float64))
 
-
-def read_manifest(run_dir: Path) -> dict:
-    return json.loads((Path(run_dir) / "manifest.json").read_text())
-
-
-def capture_key(rec: dict) -> tuple:
-    """Identifies a manifest record's data; changes when e.g. a dark frame is added."""
-    return (rec["file"], rec.get("dark_file"), float(rec["exposure_us"]), float(rec["distance_mm"]))
-
-
-def load_capture(run_dir: Path, rec: dict) -> Capture:
+def load_run(run_dir: Path) -> tuple[dict, list[CapturedPsf]]:
     run_dir = Path(run_dir)
-    raw = np.load(run_dir / rec["file"]).astype(np.float32)
-    dark_file = rec.get("dark_file")
-    if dark_file and (run_dir / dark_file).exists():
-        img = raw - np.load(run_dir / dark_file).astype(np.float32)
-        dark = True
-    else:   # no dark frame (yet): estimate a flat background
-        img = raw - float(np.percentile(raw[::4, ::4], 1))
-        dark = False
-    img /= float(rec["exposure_us"])
-    return Capture(int(rec["index"]), float(rec["distance_mm"]), rec["file"], dark_file,
-                   float(rec["exposure_us"]), img, dark, list(rec.get("warnings", [])))
-
-
-def load_captures(run_dir: Path, manifest: dict, cache: dict | None = None) -> list[Capture]:
-    """Load every PSF in the manifest, sorted by distance. `cache` maps capture_key ->
-    Capture and is reused/updated, so a growing run only loads its new files."""
-    caps = []
-    for rec in manifest.get("psfs", []):
-        k = capture_key(rec)
-        cap = cache.get(k) if cache is not None else None
-        if cap is None:
-            cap = load_capture(run_dir, rec)
-            if cache is not None:
-                cache[k] = cap
-        caps.append(cap)
-    caps.sort(key=lambda c: c.distance_mm)
-    return caps
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    psfs = []
+    for rec in manifest["psfs"]:
+        raw = np.load(run_dir / rec["file"]).astype(np.float32)
+        dark_file = rec.get("dark_file")
+        if dark_file and (run_dir / dark_file).exists():
+            img = raw - np.load(run_dir / dark_file).astype(np.float32)
+            dark = True
+        else:   # no dark frame: estimate a flat background
+            img = raw - float(np.percentile(raw[::4, ::4], 1))
+            dark = False
+        img = img / float(rec["exposure_us"])
+        psfs.append(CapturedPsf(rec["index"], float(rec["distance_mm"]), rec["file"],
+                                float(rec["exposure_us"]), img.astype(np.float32),
+                                centroid(img), dark, list(rec.get("warnings", []))))
+    if not psfs:
+        raise ValueError(f"No PSFs in {run_dir / 'manifest.json'}")
+    psfs.sort(key=lambda p: p.distance_mm)
+    return manifest, psfs
 
 
 def centroid(img: np.ndarray) -> tuple[float, float]:
@@ -115,174 +93,92 @@ def magnification(d_mm: float, t_mm: float) -> float:
     return d_mm / (d_mm - t_mm)
 
 
-def _affine(s: float, cx: float, cy: float, dx: float = 0.0, dy: float = 0.0) -> np.ndarray:
+def _scale_matrix(s: float, cx: float, cy: float, dx: float = 0.0, dy: float = 0.0) -> np.ndarray:
     """Scale by s about (cx, cy), then translate by (dx, dy)."""
     return np.float32([[s, 0, (1 - s) * cx + dx], [0, s, (1 - s) * cy + dy]])
 
 
-def _warp(img: np.ndarray, A: np.ndarray) -> np.ndarray:
-    h, w = img.shape
-    return cv2.warpAffine(img, A, (w, h), flags=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-
 # --------------------------------------------------------------------------- #
-# Estimating t (diffuser-to-sensor distance) and the scale centre
+# Estimating t (diffuser-to-sensor distance) from the run
 # --------------------------------------------------------------------------- #
 def _normalise(x: np.ndarray) -> np.ndarray:
     x = x - x.mean()
     return x / (np.linalg.norm(x) + 1e-12)
 
 
-def _xcorr(target_f: np.ndarray, moving: np.ndarray) -> np.ndarray:
-    """Normalised circular cross-correlation; peak at tau means target(x) ~ moving(x - tau)."""
+def _corr_peak(target_f: np.ndarray, moving: np.ndarray) -> float:
+    """Max of the normalised circular cross-correlation (any translation)."""
     m = np.fft.rfft2(_normalise(moving))
-    return np.fft.irfft2(target_f * np.conj(m), s=moving.shape)
+    return float(np.fft.irfft2(target_f * np.conj(m), s=moving.shape).max())
 
 
-def measure_scale(ref: np.ndarray, target: np.ndarray, lo: float = 0.4, hi: float = 1.02
-                  ) -> tuple[float, tuple[float, float], float]:
-    """Find s such that `ref` scaled by s about the image centre, then shifted, best
-    matches `target`. Returns (s, shift_xy_px, correlation peak)."""
+def relative_scale(ref: np.ndarray, target: np.ndarray, lo: float = 0.4, hi: float = 1.05
+                   ) -> tuple[float, float]:
+    """Scale s such that ref scaled by s best matches target (up to translation).
+    Returns (s, correlation peak)."""
     h, w = ref.shape
+
+    def score(r, t_f, s):
+        rh, rw = r.shape
+        warped = cv2.warpAffine(r, _scale_matrix(s, rw / 2, rh / 2), (rw, rh), flags=cv2.INTER_LINEAR)
+        return _corr_peak(t_f, warped)
+
+    def search(r, t, grid):
+        t_f = np.fft.rfft2(_normalise(t))
+        sc = np.array([score(r, t_f, s) for s in grid])
+        return grid, sc
 
     def down(img, f):
         return cv2.resize(img, (w // f, h // f), interpolation=cv2.INTER_AREA)
 
-    def search(r, t, grid):
-        rh, rw = r.shape
-        t_f = np.fft.rfft2(_normalise(t))
-        return np.array([_xcorr(t_f, _warp(r, _affine(s, rw / 2, rh / 2))).max() for s in grid])
-
     # coarse-to-fine: quarter res over the full range, half res, then full res
-    g = np.arange(lo, hi, 0.004)
-    s0 = float(g[int(np.argmax(search(down(ref, 4), down(target, 4), g)))])
-    g = np.arange(s0 - 0.006, s0 + 0.00601, 0.001)
-    s0 = float(g[int(np.argmax(search(down(ref, 2), down(target, 2), g)))])
-    step = 0.0005
-    g = np.arange(s0 - 3 * step, s0 + 3.01 * step, step)
-    sc = search(ref, target, g)
-    k = int(np.argmax(sc))
-    s = float(g[k])
-    if 0 < k < len(g) - 1:          # parabolic refinement
-        a, b, c = sc[k - 1], sc[k], sc[k + 1]
+    g, sc = search(down(ref, 4), down(target, 4), np.arange(lo, hi, 0.004))
+    s0 = float(g[int(np.argmax(sc))])
+    g, sc = search(down(ref, 2), down(target, 2), np.arange(s0 - 0.006, s0 + 0.00601, 0.001))
+    s0 = float(g[int(np.argmax(sc))])
+    fine, fs = search(ref, target, np.arange(s0 - 0.0015, s0 + 0.00151, 0.0005))
+    k = int(np.argmax(fs))
+    s_best = float(fine[k])
+    if 0 < k < len(fine) - 1:
+        a, b, c = fs[k - 1], fs[k], fs[k + 1]
         den = a - 2 * b + c
         if den < 0:
-            s += 0.5 * (a - c) / den * step
-    corr = _xcorr(np.fft.rfft2(_normalise(target)), _warp(ref, _affine(s, w / 2, h / 2)))
-    iy, ix = np.unravel_index(int(np.argmax(corr)), corr.shape)
-    shift = ((ix + w / 2) % w - w / 2, (iy + h / 2) % h - h / 2)
-    return s, (float(shift[0]), float(shift[1])), float(sc[k])
+            s_best += 0.5 * (a - c) / den * 0.0005
+    return s_best, float(fs[k])
 
 
 @dataclass
-class Geometry:
+class TEstimate:
     t_mm: float | None
-    center_px: tuple[float, float] | None     # scale centre on the sensor
     rms_residual: float | None
-    note: str                                  # "ok", or why the estimate is unreliable
-    source: str                                # where it came from (this run / given / an earlier run)
-    samples: list = field(default_factory=list)   # [distance_mm, scale, shift_x, shift_y, corr]
-
-    @property
-    def ok(self) -> bool:
-        return self.t_mm is not None and self.note == "ok"
-
-    def to_json(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_json(cls, d: dict) -> "Geometry":
-        c = d.get("center_px")
-        return cls(d.get("t_mm"), tuple(c) if c else None, d.get("rms_residual"), d.get("note", ""),
-                   d.get("source", ""), d.get("samples", []))
+    scales: list           # [(distance_mm, measured s, correlation)]
+    note: str
 
 
-def pick_samples(caps: list[Capture], n_max: int) -> list[Capture]:
-    """Captures (other than the nearest) to measure scale against: spread evenly in
-    1/d, always including the farthest (it carries the most information about t)."""
-    rest = caps[1:]
-    if len(rest) <= n_max:
-        return rest
-    inv = np.array([1 / c.distance_mm for c in rest])
-    targets = np.linspace(inv[0], inv[-1], n_max)
-    idx = sorted({int(np.argmin(np.abs(inv - v))) for v in targets} | {len(rest) - 1})
-    return [rest[i] for i in idx]
-
-
-def sample_key(caps: list[Capture], n_max: int) -> list:
-    """What an estimate from these captures depends on (for caching)."""
-    if len(caps) < 2:
-        return []
-    return [[c.file, c.distance_mm, c.dark_file] for c in [caps[0]] + pick_samples(caps, n_max)]
-
-
-def estimate_geometry(caps: list[Capture], n_max: int = 6, log=print) -> Geometry:
-    if len(caps) < 2:
-        return Geometry(None, None, None, "need at least 2 PSFs to estimate t", "this run")
-    ref = caps[0]
+def estimate_t(psfs: list[CapturedPsf], log=print) -> TEstimate:
+    if len(psfs) < 2:
+        return TEstimate(None, None, [], "need at least 2 PSFs to estimate t")
+    ref = psfs[0]
     d0 = ref.distance_mm
-    h, w = ref.image.shape
-    samples = []
-    for c in pick_samples(caps, n_max):
-        s, (sx, sy), corr = measure_scale(ref.image, c.image)
-        samples.append([c.distance_mm, s, sx, sy, corr])
-        log(f"  {d0:.1f} -> {c.distance_mm:.1f} mm: scale {s:.4f}, offset ({sx:.0f}, {sy:.0f}) px, corr {corr:.2f}")
-    S = np.array(samples)
-    d, s, wgt = S[:, 0], S[:, 1], np.clip(S[:, 4], 0.05, None)
-
-    # t: weighted least squares of s = M(d)/M(d0) over a grid
+    meas = []
+    for p in psfs[1:]:
+        s, c = relative_scale(ref.image, p.image)
+        meas.append((p.distance_mm, s, c))
+        log(f"  scale {d0:.1f} -> {p.distance_mm:.1f} mm: s={s:.4f} (corr {c:.2f})")
+    d = np.array([m[0] for m in meas])
+    s = np.array([m[1] for m in meas])
+    w = np.clip(np.array([m[2] for m in meas]), 0.05, None)
     ts = np.linspace(0.01, 0.95 * d0, 6000)
     model = (d[None, :] / (d[None, :] - ts[:, None])) * ((d0 - ts[:, None]) / d0)
-    sse = ((model - s[None, :]) ** 2 * wgt[None, :]).sum(axis=1)
+    sse = ((model - s[None, :]) ** 2 * w[None, :]).sum(axis=1)
     k = int(np.argmin(sse))
-    rms = float(np.sqrt(sse[k] / wgt.sum()))
+    rms = float(np.sqrt(sse[k] / w.sum()))
     note = "ok"
-    if np.median(wgt) < 0.3:
+    if np.median(w) < 0.3:
         note = "low correlation between PSFs - estimate unreliable, set t manually"
     elif k in (0, len(ts) - 1):
         note = "fit hit the search bound - estimate unreliable, set t manually"
-    elif 1 - s.min() < 0.01:
-        note = "captured depth range too small to measure t reliably"
-
-    # scale centre: scaling about c instead of the image centre o adds an offset (1-s)(c-o)
-    a = 1 - s
-    if (a * a).sum() > 1e-5:
-        off = (a[:, None] * S[:, 2:4]).sum(0) / (a * a).sum()
-        center = (w / 2 + float(off[0]), h / 2 + float(off[1]))
-    else:
-        center = centroid(ref.image)
-    return Geometry(float(ts[k]), center, rms, note, "this run", samples)
-
-
-# --------------------------------------------------------------------------- #
-# Brightness vs depth
-# --------------------------------------------------------------------------- #
-class EnergyCurve:
-    """Total captured energy (counts/us) vs depth: a smooth fit of log E against log z
-    over the captures (quadratic with >= 4 captures, else linear), so exposure jitter
-    on single captures doesn't make the brightness jump. Beyond the captured range it
-    continues as 1/z^2 from the end of the fit."""
-
-    def __init__(self, caps: list[Capture], t_mm: float):
-        self.t = t_mm
-        self.d = np.array([c.distance_mm for c in caps])
-        e = np.array([max(c.energy, 1e-12) for c in caps])
-        lz = np.log(self.d - t_mm)
-        deg = 2 if len(caps) >= 4 else (1 if len(caps) >= 2 else 0)
-        self.coef = np.polyfit(lz, np.log(e), deg) if deg else np.array([np.log(e[0]) + 2 * lz[0]])
-        self.flat_z2 = deg == 0          # single capture: pure 1/z^2 through it
-        self.residual = (np.exp(np.log(e) - self._fit(lz)) - 1) if deg else np.zeros(1)
-
-    def _fit(self, lz):
-        if self.flat_z2:
-            return self.coef[0] - 2 * lz
-        return np.polyval(self.coef, lz)
-
-    def __call__(self, d_mm: float) -> float:
-        d_end = float(np.clip(d_mm, self.d.min(), self.d.max()))
-        e_end = float(np.exp(self._fit(np.log(d_end - self.t))))
-        return e_end * ((d_end - self.t) / (d_mm - self.t)) ** 2
+    return TEstimate(float(ts[k]), rms, meas, note)
 
 
 # --------------------------------------------------------------------------- #
@@ -296,129 +192,94 @@ class Prediction:
 
 
 class PsfModel:
-    def __init__(self, run_dir: Path, manifest: dict, caps: list[Capture], geometry: Geometry,
-                 pixel_pitch_um: float = PIXEL_PITCH_UM):
-        if not caps:
-            raise ValueError("no PSFs captured yet")
-        if geometry.t_mm is None:
-            raise ValueError(f"t unknown ({geometry.note}); pass --t-mm")
+    def __init__(self, run_dir: Path, t_mm: float | None = None,
+                 pixel_pitch_um: float = PIXEL_PITCH_UM, log=print):
         self.run_dir = Path(run_dir)
-        self.manifest = manifest
-        self.caps = caps
-        self.geometry = geometry
-        self.t_mm = float(geometry.t_mm)
-        self.center = geometry.center_px or centroid(caps[0].image)
+        self.manifest, self.psfs = load_run(self.run_dir)
         self.pitch_mm = pixel_pitch_um / 1000.0
-        self.h, self.w = caps[0].image.shape
-        self._curves: dict[float, EnergyCurve] = {}
-
-    @classmethod
-    def from_run(cls, run_dir: Path, t_mm: float | None = None,
-                 pixel_pitch_um: float = PIXEL_PITCH_UM, log=print) -> "PsfModel":
-        manifest = read_manifest(run_dir)
-        caps = load_captures(run_dir, manifest)
+        self.h, self.w = self.psfs[0].image.shape
         if t_mm is None:
-            geo = estimate_geometry(caps, log=log)
+            log(f"Estimating diffuser-to-sensor distance t from {len(self.psfs)} PSFs...")
+            self.t_estimate = estimate_t(self.psfs, log)
+            if self.t_estimate.t_mm is None:
+                raise ValueError("Can't estimate t (" + self.t_estimate.note + "); pass t_mm")
+            log(f"  t = {self.t_estimate.t_mm:.3f} mm (rms residual {self.t_estimate.rms_residual:.4f}, "
+                f"{self.t_estimate.note})")
         else:
-            g = estimate_geometry(caps, log=log) if len(caps) >= 2 else None
-            geo = Geometry(t_mm, g.center_px if g else None, None, "ok", "given")
-        return cls(run_dir, manifest, caps, geo, pixel_pitch_um)
+            self.t_estimate = TEstimate(None, None, [], "t given explicitly")
+        self.t_mm = float(t_mm if t_mm is not None else self.t_estimate.t_mm)
 
     @property
     def depth_range(self) -> tuple[float, float]:
-        return self.caps[0].distance_mm, self.caps[-1].distance_mm
+        return self.psfs[0].distance_mm, self.psfs[-1].distance_mm
 
-    def curve(self, t: float) -> EnergyCurve:
-        if t not in self._curves:
-            if len(self._curves) > 8:
-                self._curves.clear()
-            self._curves[t] = EnergyCurve(self.caps, t)
-        return self._curves[t]
+    def nearest(self, d_mm: float) -> CapturedPsf:
+        return min(self.psfs, key=lambda p: abs(1 / p.distance_mm - 1 / d_mm))
 
-    def _t(self, t_mm):
-        t = self.t_mm if t_mm is None else float(t_mm)
-        if not (np.isfinite(t) and 0 < t < self.depth_range[0]):
-            raise ValueError(f"t must be between 0 and the nearest capture ({self.depth_range[0]:.1f} mm)")
-        return t
-
-    def bracket(self, d_mm: float) -> list[tuple[Capture, float]]:
-        """Captures used for depth d, with blend weights (linear in 1/d)."""
-        inv = 1 / d_mm
-        lo, hi = self.depth_range
-        if d_mm <= lo:
-            return [(self.caps[0], 1.0)]
-        if d_mm >= hi:
-            return [(self.caps[-1], 1.0)]
-        for a, b in zip(self.caps, self.caps[1:]):
-            if a.distance_mm <= d_mm <= b.distance_mm:
-                ia, ib = 1 / a.distance_mm, 1 / b.distance_mm
-                wa = (inv - ib) / (ia - ib) if ia != ib else 1.0
-                out = [(a, wa), (b, 1 - wa)]
-                return [(c, w) for c, w in out if w > 1e-6]
-        raise AssertionError("unreachable")
+    def _check(self, d_mm: float, t: float):
+        if not d_mm > t:
+            raise ValueError(f"depth {d_mm} mm must be greater than t = {t:.3f} mm")
 
     def shift_px(self, x_mm: float, y_mm: float, d_mm: float, t: float) -> tuple[float, float]:
         k = -t / (d_mm - t) / self.pitch_mm
         return k * x_mm, k * y_mm
 
+    def _depth_transform(self, d_mm: float, t: float):
+        ref = self.nearest(d_mm)
+        s = magnification(d_mm, t) / magnification(ref.distance_mm, t)
+        bright = ((ref.distance_mm - t) / (d_mm - t)) ** 2 / s ** 2
+        return ref, s, bright
+
     def predict(self, x_mm: float, y_mm: float, d_mm: float, t_mm: float | None = None) -> Prediction:
-        t = self._t(t_mm)
-        if not d_mm > t:
-            raise ValueError(f"depth {d_mm} mm must be greater than t = {t:.3f} mm")
+        t = self.t_mm if t_mm is None else float(t_mm)
+        self._check(d_mm, t)
+        ref, s, bright = self._depth_transform(d_mm, t)
         dx, dy = self.shift_px(x_mm, y_mm, d_mm, t)
-        cx, cy = self.center
-        e_target = self.curve(t)(d_mm)
-        img = np.zeros((self.h, self.w), np.float32)
-        known = np.ones((self.h, self.w), bool)
-        used = []
-        for cap, wgt in self.bracket(d_mm):
-            s = magnification(d_mm, t) / magnification(cap.distance_mm, t)
-            A = _affine(s, cx, cy, dx, dy)
-            # warping by s multiplies the sum by s^2; normalise to the target energy
-            gain = wgt * e_target / (s * s * cap.energy) if cap.energy > 0 else 0.0
-            img += _warp(cap.image, A) * np.float32(gain)
-            known &= _warp(np.ones_like(cap.image), A) > 0.999
-            used.append({"index": cap.index, "distance_mm": cap.distance_mm, "file": cap.file,
-                         "weight": wgt, "scale": s, "dark_subtracted": cap.dark_subtracted,
-                         "warnings": cap.warnings})
-        on_sensor = float(img.sum(dtype=np.float64))
+        cx, cy = ref.centroid
+        A = _scale_matrix(s, cx, cy, dx, dy)
+        img = cv2.warpAffine(ref.image, A, (self.w, self.h), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0) * bright
+        known = cv2.warpAffine(np.ones_like(ref.image), A, (self.w, self.h), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0.999
+        full_energy = float(ref.image.sum()) * bright * s * s   # all captured light, scaled
+        on_sensor = float(img.sum())
         peak = float(np.percentile(img[known], 99.999)) if known.any() else 0.0
         d_lo, d_hi = self.depth_range
         info = {
             "x_mm": x_mm, "y_mm": y_mm, "d_mm": d_mm, "t_mm": t,
             "z_from_diffuser_mm": d_mm - t,
-            "based_on": used,
-            "nearest_capture_index": max(used, key=lambda u: u["weight"])["index"],
+            "nearest_capture": {"index": ref.index, "distance_mm": ref.distance_mm, "file": ref.file,
+                                "dark_subtracted": ref.dark_subtracted, "warnings": ref.warnings},
+            "scale_from_capture": s,
             "magnification": magnification(d_mm, t),
             "shift_px": [dx, dy],
             "scale_center_px": [cx, cy],
-            "total_energy_counts_per_us": e_target,
-            "energy_on_sensor_frac": on_sensor / e_target if e_target > 0 else 0.0,
+            "captured_energy_on_sensor": on_sensor / full_energy if full_energy > 0 else 0.0,
             "unknown_area_frac": float(1 - known.mean()),
             "peak_counts_per_us": peak,
             "exposure_for_75pct_us": (0.75 * SENSOR_MAX / peak) if peak > 0 else None,
             "extrapolated_depth": not (d_lo - 1e-6 <= d_mm <= d_hi + 1e-6),
         }
-        return Prediction(img, known, info)
+        return Prediction(img.astype(np.float32), known, info)
 
     def fov_map(self, d_mm: float, t_mm: float | None = None, nx: int = 161, ny: int = 101):
-        """Fraction of the PSF's light that lands on the sensor, for points across the
-        object plane at depth d. Returns (map[ny, nx], x_max_mm, y_max_mm)."""
-        t = self._t(t_mm)
-        if not d_mm > t:
-            raise ValueError(f"depth {d_mm} mm must be greater than t = {t:.3f} mm")
-        cap = max(self.bracket(d_mm), key=lambda cw: cw[1])[0]
-        s = magnification(d_mm, t) / magnification(cap.distance_mm, t)
-        scaled = _warp(cap.image, _affine(s, *self.center)).astype(np.float64)
-        total = cap.energy * s * s
+        """Fraction of the captured PSF energy that lands on the sensor, for points
+        across the object plane at depth d. Returns (map[ny, nx], x_max_mm, y_max_mm)."""
+        t = self.t_mm if t_mm is None else float(t_mm)
+        self._check(d_mm, t)
+        ref, s, _ = self._depth_transform(d_mm, t)
+        cx, cy = ref.centroid
+        scaled = cv2.warpAffine(ref.image, _scale_matrix(s, cx, cy), (self.w, self.h),
+                                flags=cv2.INTER_LINEAR).astype(np.float64)
+        total = scaled.sum()
+        if total <= 0:
+            return np.zeros((ny, nx)), 1.0, 1.0
+        ii = cv2.integral(scaled)       # (h+1, w+1)
         mm_per_px = self.pitch_mm * (d_mm - t) / t     # object mm per pixel of shift
         x_max, y_max = self.w * mm_per_px, self.h * mm_per_px
-        if total <= 0:
-            return np.zeros((ny, nx)), x_max, y_max
-        ii = cv2.integral(scaled)       # (h+1, w+1)
         xs = np.linspace(-x_max, x_max, nx)
         ys = np.linspace(-y_max, y_max, ny)
-        k = -1 / mm_per_px
+        k = -t / (d_mm - t) / self.pitch_mm
         # pattern pixel u lands at u + shift; it's on the sensor if 0 <= u + shift < size
         sx = np.clip(np.round(k * xs).astype(int), -self.w, self.w)
         sy = np.clip(np.round(k * ys).astype(int), -self.h, self.h)
@@ -427,17 +288,17 @@ class PsfModel:
         Y0, X0 = np.meshgrid(y0, x0, indexing="ij")
         Y1, X1 = np.meshgrid(y1, x1, indexing="ij")
         energy = ii[Y1, X1] - ii[Y0, X1] - ii[Y1, X0] + ii[Y0, X0]
-        return np.clip(energy / total, 0, 1), x_max, y_max
+        return energy / total, x_max, y_max
 
 
 # --------------------------------------------------------------------------- #
-# Display
+# Display helpers
 # --------------------------------------------------------------------------- #
 def render(img: np.ndarray, known: np.ndarray | None = None, gamma: float = 0.5,
-           scale: float = 0.6) -> np.ndarray:
+           scale: float = 0.6, hi: float | None = None) -> np.ndarray:
     """float image -> 8-bit BGR. Unknown region tinted blue."""
     vals = img[known] if known is not None and known.any() else img
-    hi = max(float(np.percentile(vals, 99.9)), 1e-9)
+    hi = hi or max(float(np.percentile(vals, 99.9)), 1e-9)
     g = np.clip(img / hi, 0, 1) ** gamma
     bgr = cv2.applyColorMap((g * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
     if known is not None and not known.all():

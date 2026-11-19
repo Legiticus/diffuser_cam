@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-PSF viewer: shows the most recent psf_capture run and predicts the sensor PSF for
-any point (x, y, d) in front of the camera (see psf_model.py for how).
+Interactive PSF viewer for a psf_capture run.
 
-    python3 app.py                       # follow the newest run in camera_node/data/
-    python3 app.py --run ../camera_node/data/psf_20261116_111557   # one fixed run
-    python3 app.py --t-mm 2.6            # use a known diffuser-to-sensor distance
+Pick a point in the object space (x, y at depth d) and see the PSF the sensor should
+record for it, predicted from the captured PSFs (see psf_model.py for the model).
 
-Then open http://<pi>:8003/. The page switches to a new run (or new PSFs in a run
-being captured) by itself.
+    python3 app.py                              # latest run in camera_node/data/
+    python3 app.py ../camera_node/data/psf_20261115_192500 --t-mm 6.2
+    python3 synthetic.py /tmp/demo && python3 app.py /tmp/demo   # try without real data
+
+Then open http://<pi>:8003/
 """
 
 from __future__ import annotations
 
 import argparse
 import io
-import logging
 import math
 import socket
 import sys
@@ -26,36 +26,29 @@ import numpy as np
 from flask import Flask, Response, jsonify, request
 
 from psf_model import PIXEL_PITCH_UM, PsfModel, render
-from runs import RunWatcher
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA = REPO_ROOT / "camera_node" / "data"
 
 
-class NotReady(Exception):
-    pass
+def latest_run(data_dir: Path) -> Path:
+    runs = sorted(p.parent for p in data_dir.glob("psf_*/manifest.json"))
+    if not runs:
+        raise SystemExit(f"No runs with a manifest.json in {data_dir}; pass a run directory")
+    return runs[-1]
 
 
-def create_app(watcher: RunWatcher) -> Flask:
+def create_app(model: PsfModel) -> Flask:
     app = Flask(__name__)
 
-    def current() -> PsfModel:
-        m = watcher.model
-        if m is None:
-            raise NotReady(watcher.snapshot()["message"] or "no data loaded yet")
-        return m
-
-    def params(m: PsfModel):
+    def params():
         a = request.args
-        try:
-            x = float(a.get("x", 0))
-            y = float(a.get("y", 0))
-            d = float(a.get("d", m.depth_range[0]))
-            t = float(a["t"]) if a.get("t") else None
-        except ValueError:
-            raise ValueError("x, y, d and t must be numbers") from None
-        if not all(math.isfinite(v) for v in (x, y, d)):
-            raise ValueError("x, y and d must be finite numbers")
+        x = float(a.get("x", 0))
+        y = float(a.get("y", 0))
+        d = float(a.get("d", model.depth_range[0]))
+        t = float(a["t"]) if a.get("t") else model.t_mm
+        if not all(math.isfinite(v) for v in (x, y, d, t)) or t <= 0:
+            raise ValueError("x, y, d and t must be finite numbers, t > 0")
         return x, y, d, t
 
     def png(bgr) -> Response:
@@ -66,80 +59,61 @@ def create_app(watcher: RunWatcher) -> Flask:
     def bad_request(e):
         return jsonify(error=str(e)), 400
 
-    @app.errorhandler(NotReady)
-    def not_ready(e):
-        return jsonify(error=str(e), state=watcher.snapshot()), 503
-
     @app.get("/")
     def index():
         return (Path(__file__).parent / "templates" / "index.html").read_text()
 
-    @app.get("/api/state")
-    def state():
-        return jsonify(watcher.snapshot())
-
     @app.get("/api/info")
     def info():
-        m = current()
-        g = m.geometry
-        curve = m.curve(m.t_mm)
+        est = model.t_estimate
         return jsonify(
-            version=watcher.version, run_dir=str(m.run_dir), run_name=m.run_dir.name,
-            run_status=m.manifest.get("status"), created=m.manifest.get("created"),
-            sensor=m.manifest.get("sensor"), t_mm=m.t_mm, scale_center_px=list(m.center),
-            pixel_pitch_um=m.pitch_mm * 1000, sensor_wh=[m.w, m.h], depth_range=m.depth_range,
-            geometry={"t_mm": g.t_mm, "note": g.note, "source": g.source,
-                      "rms_residual": g.rms_residual, "ok": g.ok},
-            energy_fit_max_residual=float(np.abs(curve.residual).max()),
-            run_warnings=m.manifest.get("warnings", []),
-            captures=[{"index": c.index, "distance_mm": c.distance_mm, "file": c.file,
-                       "exposure_us": c.exposure_us, "dark_subtracted": c.dark_subtracted,
-                       "warnings": c.warnings} for c in m.caps])
+            run_dir=str(model.run_dir), t_mm=model.t_mm, pixel_pitch_um=model.pitch_mm * 1000,
+            sensor_wh=[model.w, model.h], depth_range=model.depth_range,
+            t_estimate={"t_mm": est.t_mm, "rms_residual": est.rms_residual, "note": est.note,
+                        "scales": est.scales},
+            captures=[{"index": p.index, "distance_mm": p.distance_mm, "file": p.file,
+                       "exposure_us": p.exposure_us, "dark_subtracted": p.dark_subtracted,
+                       "warnings": p.warnings} for p in model.psfs])
 
     @app.get("/api/predict.json")
     def predict_json():
-        m = current()
-        return jsonify(m.predict(*params(m)).info)
+        return jsonify(model.predict(*params()).info)
 
     @app.get("/api/predict.png")
     def predict_png():
-        m = current()
-        p = m.predict(*params(m))
-        return png(render(p.image, p.known, gamma=float(request.args.get("gamma", 0.5))))
+        p = model.predict(*params())
+        gamma = float(request.args.get("gamma", 0.5))
+        return png(render(p.image, p.known, gamma=gamma, scale=0.6))
 
     @app.get("/api/predict.npy")
     def predict_npy():
-        m = current()
-        x, y, d, t = params(m)
-        p = m.predict(x, y, d, t)
+        x, y, d, t = params()
+        p = model.predict(x, y, d, t)
         bio = io.BytesIO()
         np.save(bio, p.image)
-        name = f"psf_pred_{m.run_dir.name}_x{x:g}_y{y:g}_d{d:g}mm.npy"
+        name = f"psf_pred_x{x:g}_y{y:g}_z{d:g}mm.npy"
         return Response(bio.getvalue(), mimetype="application/octet-stream",
                         headers={"Content-Disposition": f"attachment; filename={name}"})
 
     @app.get("/api/fov.json")
     def fov_json():
-        m = current()
-        _, _, d, t = params(m)
-        _, x_max, y_max = m.fov_map(d, t, nx=3, ny=3)
+        _, _, d, t = params()
+        _, x_max, y_max = model.fov_map(d, t, nx=3, ny=3)
         return jsonify(x_max_mm=x_max, y_max_mm=y_max)
 
     @app.get("/api/fov.png")
     def fov_png():
-        m = current()
-        _, _, d, t = params(m)
-        frac, _, _ = m.fov_map(d, t)
-        img = cv2.applyColorMap((frac * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+        _, _, d, t = params()
+        frac, _, _ = model.fov_map(d, t)
+        img = cv2.applyColorMap((np.clip(frac, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
         return png(cv2.resize(img, (480, 300), interpolation=cv2.INTER_LINEAR))
 
     @app.get("/api/captured/<int:i>.png")
     def captured_png(i: int):
-        m = current()
-        c = next((c for c in m.caps if c.index == i), None)
-        if c is None:
+        p = next((p for p in model.psfs if p.index == i), None)
+        if p is None:
             return jsonify(error="no such capture"), 404
-        return png(render(c.image, gamma=float(request.args.get("gamma", 0.5))))
+        return png(render(p.image, gamma=float(request.args.get("gamma", 0.5)), scale=0.6))
 
     return app
 
@@ -156,24 +130,17 @@ def _local_ip() -> str:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="PSF viewer for psf_capture runs")
-    p.add_argument("--data-dir", default=str(DEFAULT_DATA),
-                   help="folder psf_capture writes runs to; the newest run is shown (default: %(default)s)")
-    p.add_argument("--run", help="show this one run folder instead of following the newest")
+    p = argparse.ArgumentParser(description="Interactive PSF viewer for a psf_capture run")
+    p.add_argument("run_dir", nargs="?", help=f"capture run folder (default: latest in {DEFAULT_DATA})")
     p.add_argument("--t-mm", type=float, help="diffuser-to-sensor distance (mm); estimated from the run if omitted")
     p.add_argument("--pixel-um", type=float, default=PIXEL_PITCH_UM, help="sensor pixel pitch (um)")
-    p.add_argument("--poll", type=float, default=2.0, help="seconds between checks for new data")
     p.add_argument("--port", type=int, default=8003)
     a = p.parse_args(argv)
-    if a.t_mm is not None and not a.t_mm > 0:
-        p.error("--t-mm must be > 0")
-    watcher = RunWatcher(data_dir=None if a.run else a.data_dir, run_dir=a.run, t_mm=a.t_mm,
-                         pixel_pitch_um=a.pixel_um, poll_s=a.poll).start()
-    print(f"Watching {a.run or a.data_dir}")
+    run = Path(a.run_dir) if a.run_dir else latest_run(DEFAULT_DATA)
+    print(f"Loading {run}")
+    model = PsfModel(run, a.t_mm, a.pixel_um)
     print(f"Viewer on http://{_local_ip()}:{a.port}/")
-    # the page polls /api/state every 2 s; don't log every request
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    create_app(watcher).run(host="0.0.0.0", port=a.port, threaded=True)
+    create_app(model).run(host="0.0.0.0", port=a.port, threaded=True)
     return 0
 
 

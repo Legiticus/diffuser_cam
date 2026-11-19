@@ -2,34 +2,25 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PSF Viewer</title>
 <style>
- :root{--bg:#111;--card:#1c1c1c;--fg:#ddd;--mute:#888;--acc:#4fc3f7;--warn:#ffb74d;--ok:#81c784}
+ :root{--bg:#111;--card:#1c1c1c;--fg:#ddd;--mute:#888;--acc:#4fc3f7;--warn:#ffb74d}
  *{box-sizing:border-box} body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:12px}
- h3{margin:4px 0 6px} .row{display:flex;flex-wrap:wrap;gap:12px}
+ h3{margin:4px 0 10px} .row{display:flex;flex-wrap:wrap;gap:12px}
  .card{background:var(--card);padding:10px;border-radius:6px;min-width:0}
- img{width:100%;display:block;background:#000}
- label{font-size:13px;color:var(--mute)} input[type=number]{width:84px;background:#000;color:var(--fg);border:1px solid #333;padding:3px}
+ img{max-width:100%;display:block;background:#000}
+ label{font-size:13px;color:var(--mute)} input[type=number]{width:80px;background:#000;color:var(--fg);border:1px solid #333;padding:3px}
  input[type=range]{width:100%} .ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:6px 0}
  .pick{position:relative;cursor:crosshair} .pick canvas{position:absolute;left:0;top:0;width:100%;height:100%}
  table{border-collapse:collapse;font-size:13px;width:100%} td{padding:3px 6px;border-bottom:1px solid #2a2a2a;vertical-align:top}
  td:first-child{color:var(--mute);white-space:nowrap} .warn{color:var(--warn)} .small{font-size:12px;color:var(--mute)}
  .caps{display:flex;flex-wrap:wrap;gap:6px} .caps button{background:#000;color:var(--fg);border:1px solid #333;padding:4px 8px;border-radius:4px;cursor:pointer}
- .caps button.on{border-color:var(--acc);color:var(--acc)} .caps button.warn{border-color:#6a4a1a}
- .bar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;font-size:13px}
- .chip{padding:2px 8px;border-radius:10px;border:1px solid #333;font-size:12px}
- .chip.live{border-color:var(--acc);color:var(--acc)} .chip.done{border-color:var(--ok);color:var(--ok)} .chip.bad{border-color:var(--warn);color:var(--warn)}
- #banner{display:none;margin:8px 0;padding:6px 10px;border-radius:4px;background:#12324a;color:#cde;font-size:13px}
- #busy{color:var(--acc)}
+ .caps button.on{border-color:var(--acc);color:var(--acc)}
 </style></head><body>
 <h3>DiffuserCam PSF viewer</h3>
-<div class="bar">
- <b id="runname">–</b><span class="chip" id="runstat"></span>
- <span class="small" id="runmeta"></span><span class="small" id="busy"></span>
-</div>
-<div id="banner"></div>
+<div class="small" id="run"></div>
 <div class="row" style="margin-top:8px">
  <div class="card" style="flex:1 1 420px">
   <b>1. Choose a point</b>
-  <div class="small">Object plane at depth d. Click to place the point. Colour = share of the PSF's light that lands on the sensor (yellow = all of it).</div>
+  <div class="small">Object plane at depth d. Click to place the point. Colour = fraction of the PSF that lands on the sensor (yellow = all of it).</div>
   <div class="pick" id="pick"><img id="fov" alt="field of view map"><canvas id="cv"></canvas></div>
   <div class="ctl">
    <label>x (mm) <input type="number" id="x" step="0.1" value="0"></label>
@@ -39,7 +30,7 @@
   <input type="range" id="d" step="0.1" aria-label="depth">
   <div class="small" id="drange"></div>
   <div class="ctl">
-   <label>t (mm) <input type="number" id="t" step="0.01" placeholder="auto"></label>
+   <label>t (mm) <input type="number" id="t" step="0.01"></label>
    <span class="small" id="test"></span>
   </div>
   <div class="small">Captured depths (click to jump):</div>
@@ -59,51 +50,24 @@
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let info=null, ver=-1, ext={x:1,y:1}, timer=null, first=true;
+let info=null, ext={x:1,y:1}, timer=null;
+const q=()=>{const p=new URLSearchParams({x:$('x').value||0,y:$('y').value||0,d:$('dn').value,t:$('t').value});return p.toString()};
 const f=(v,n=3)=>v==null?'–':(+v).toFixed(n);
-const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const q=()=>new URLSearchParams({x:$('x').value||0,y:$('y').value||0,d:$('dn').value,t:$('t').value,v:ver}).toString();
 
-function showState(s){
- const busy=s.phase==='loading'||s.phase==='starting';
- $('busy').textContent=busy?(s.message||'loading…'):(s.phase==='error'||s.phase==='waiting'?s.message:'');
- $('busy').className=s.phase==='error'?'small warn':'small';
- if(!info){$('runname').textContent=s.run?s.run.split('/').pop():'no data yet';}
-}
-
-function runChip(st,n){
- const c=$('runstat');
- if(st==='running'){c.textContent=`capturing · ${n} PSFs so far`;c.className='chip live'}
- else if(st==='complete'){c.textContent=`complete · ${n} PSFs`;c.className='chip done'}
- else{c.textContent=`${st||'?'} · ${n} PSFs`;c.className='chip bad'}
-}
-
-async function loadInfo(){
- const r=await fetch('api/info');if(!r.ok)return;
- const prev=info;info=await r.json();ver=info.version;
- if(prev&&prev.run_dir!==info.run_dir){$('banner').style.display='block';
-  $('banner').textContent=`Switched to the newest run: ${info.run_name} (was ${prev.run_name}).`}
- $('runname').textContent=info.run_name;runChip(info.run_status,info.captures.length);
- $('runmeta').textContent=`${info.created||''} · ${info.sensor||''} · ${info.pixel_pitch_um} µm pixels · updated ${new Date().toLocaleTimeString()}`;
+async function init(){
+ info=await (await fetch('api/info')).json();
+ $('run').textContent='Run: '+info.run_dir+'  ·  pixel pitch '+info.pixel_pitch_um+' µm';
  const [lo,hi]=info.depth_range;
- $('d').min=lo;$('d').max=hi;
- if(first||!(+$('dn').value>info.t_mm)){$('d').value=lo;$('dn').value=lo;first=false}else{$('d').value=$('dn').value}
- $('drange').textContent=`captured ${lo.toFixed(1)} – ${hi.toFixed(1)} mm (outside that the depth is extrapolated)`;
- $('t').placeholder=info.t_mm.toFixed(3);
- const g=info.geometry;
- $('test').innerHTML=`auto: ${f(g.t_mm)} mm from ${esc(g.source)}`+(g.ok?'':` <span class="warn">(${esc(g.note)})</span>`);
+ $('d').min=lo;$('d').max=hi;$('d').value=lo;$('dn').value=lo;
+ $('drange').textContent=`captured range ${lo.toFixed(1)} – ${hi.toFixed(1)} mm (outside it the depth is extrapolated)`;
+ $('t').value=info.t_mm.toFixed(3);
+ const e=info.t_estimate;
+ $('test').innerHTML=e.t_mm!=null?`estimated from run: ${e.t_mm.toFixed(3)} mm <span class="${e.note==='ok'?'':'warn'}">(${e.note})</span>`:e.note;
  $('caps').innerHTML='';
- info.captures.forEach(c=>{const b=document.createElement('button');b.textContent=c.distance_mm.toFixed(1);b.dataset.i=c.index;
-  const w=[...c.warnings];if(!c.dark_subtracted)w.push('no dark frame');
-  b.title=`${c.file} · ${c.exposure_us} µs`+(w.length?' – '+w.join('; '):'');if(w.length)b.classList.add('warn');
+ info.captures.forEach(c=>{const b=document.createElement('button');b.textContent=c.distance_mm.toFixed(1);
+  b.title=c.file+(c.warnings.length?' – '+c.warnings.join('; '):'');if(c.warnings.length)b.classList.add('warn');
   b.onclick=()=>{$('dn').value=c.distance_mm;$('d').value=c.distance_mm;update(true)};$('caps').appendChild(b)});
  update(true);
-}
-
-async function poll(){
- try{const s=await (await fetch('api/state')).json();showState(s);
-  if(s.version!==ver&&s.version>0)await loadInfo();}catch(e){$('busy').textContent='viewer not reachable'}
- setTimeout(poll,2000);
 }
 
 function drawCross(){
@@ -115,8 +79,7 @@ function drawCross(){
  g.fillStyle='rgba(255,255,255,.7)';g.font='11px system-ui';g.fillText(`±${ext.x.toFixed(1)} × ±${ext.y.toFixed(1)} mm`,6,14);
 }
 
-function update(fovToo){
- if(!info)return;
+async function update(fovToo){
  clearTimeout(timer);
  timer=setTimeout(async()=>{
   const qs=q();
@@ -126,20 +89,16 @@ function update(fovToo){
   }
   drawCross();
   const r=await fetch('api/predict.json?'+qs),j=await r.json();
-  if(!r.ok){$('info').innerHTML=`<tr><td class="warn">error</td><td class="warn">${esc(j.error)}</td></tr>`;return}
+  if(!r.ok){$('info').innerHTML=`<tr><td class="warn">error</td><td class="warn">${j.error}</td></tr>`;return}
   const gam=$('gam').checked?0.5:1;
-  $('pred').src=$('cmp').checked?`api/captured/${j.nearest_capture_index}.png?gamma=${gam}&v=${ver}`:`api/predict.png?${qs}&gamma=${gam}`;
+  $('pred').src=$('cmp').checked?`api/captured/${j.nearest_capture.index}.png?gamma=${gam}`:`api/predict.png?${qs}&gamma=${gam}`;
   $('dl').href='api/predict.npy?'+qs;
-  document.querySelectorAll('#caps button').forEach(b=>b.classList.toggle('on',j.based_on.some(u=>u.index==b.dataset.i)));
-  const src=j.based_on.map(u=>`#${u.index} at ${f(u.distance_mm,1)} mm (${f(100*u.weight,0)}%, scaled ${f(u.scale,4)})`
-    +(u.dark_subtracted?'':' <span class="warn">no dark frame</span>')
-    +(u.warnings.length?' <span class="warn">'+esc(u.warnings.join('; '))+'</span>':'')).join('<br>');
-  const rows=[
-   ['point',`x=${f(j.x_mm,2)}, y=${f(j.y_mm,2)} mm at d=${f(j.d_mm,2)} mm (${f(j.z_from_diffuser_mm,2)} mm from the diffuser)`],
-   ['built from',src],
-   ['magnification',`${f(j.magnification,4)} about (${f(j.scale_center_px[0],0)}, ${f(j.scale_center_px[1],0)}) px`],
+  const n=j.nearest_capture, rows=[
+   ['point',`x=${f(j.x_mm,2)}, y=${f(j.y_mm,2)} mm at d=${f(j.d_mm,2)} mm (${f(j.z_from_diffuser_mm,2)} mm from diffuser)`],
+   ['based on capture',`#${n.index} at ${f(n.distance_mm,2)} mm${n.dark_subtracted?'':' <span class="warn">(no dark frame)</span>'}${n.warnings.length?' <span class="warn">'+n.warnings.join('; ')+'</span>':''}`],
+   ['scale vs capture',`${f(j.scale_from_capture,4)} (magnification ${f(j.magnification,4)})`],
    ['shift on sensor',`${f(j.shift_px[0],1)}, ${f(j.shift_px[1],1)} px`],
-   ['PSF light on sensor',`${f(100*j.energy_on_sensor_frac,1)} %`],
+   ['PSF light on sensor',`${f(100*j.captured_energy_on_sensor,1)} %`],
    ['unknown area',`${f(100*j.unknown_area_frac,1)} %`],
    ['peak',`${f(j.peak_counts_per_us,4)} counts/µs → ~${j.exposure_for_75pct_us?Math.round(j.exposure_for_75pct_us):'–'} µs for 75% full scale`],
   ];
@@ -157,5 +116,5 @@ $('dn').addEventListener('change',()=>{$('d').value=$('dn').value;update(true)})
 $('t').addEventListener('change',()=>update(true));
 ['gam','cmp'].forEach(k=>$(k).addEventListener('change',()=>update(false)));
 $('fov').addEventListener('load',drawCross);window.addEventListener('resize',drawCross);
-poll();
+init();
 </script></body></html>

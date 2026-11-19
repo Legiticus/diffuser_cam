@@ -1,0 +1,25 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PSF Capture</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#111;color:#ddd;margin:0;padding:12px}
+ .row{display:flex;flex-wrap:wrap;gap:12px} .card{background:#1c1c1c;padding:10px;border-radius:6px}
+ img{max-width:100%;display:block;background:#000} pre{font-size:12px;white-space:pre-wrap;margin:0}
+</style></head><body>
+<h3 style="margin:4px 0 10px">DiffuserCam PSF capture</h3>
+<div class="row">
+ <div class="card" style="flex:2 1 480px"><b>Live</b>
+  <span style="font-size:12px">(contrast stretched, red = saturated)</span>
+  <img src="stream.mjpg"></div>
+ <div class="card" style="flex:1 1 320px"><b>Last saved PSF</b><img id="last">
+  <pre id="status"></pre></div>
+</div>
+<script>
+let lastIdx=-1;
+async function poll(){try{const s=await (await fetch('api/status')).json();
+ status.textContent=JSON.stringify(s,null,1);
+ const k=s.last_capture?s.last_capture.index:-1;
+ if(k!==lastIdx){lastIdx=k;last.src='api/last_capture.jpg?i='+k}}catch(e){}
+ setTimeout(poll,1000)}
+poll();
+</script></body></html>
