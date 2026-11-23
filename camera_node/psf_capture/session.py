@@ -113,7 +113,7 @@ class CaptureSession:
             per = (time.monotonic() - self.t_sweep) / self.positions_done
             eta = per * (total - self.positions_done)
         self.b.changed(progress={**self.b.progress, "positions_done": self.positions_done,
-                                 "positions_total": total, "frames": self.frame_count,
+                                 "positions_total": total, "passes": self.opt["passes"], "frames": self.frame_count,
                                  "eta_s": eta, "z_mm": self.b.stage.z, **extra})
 
     # --- the procedure ----------------------------------------------------------------
@@ -267,6 +267,7 @@ class CaptureSession:
         exposures = sorted({f["requested_exposure_us"] for f in self.meta["frames"]})
         if not exposures:
             return
+        self.report(phase="background")
         self.b.ask_user("light_off", "Turn the light source OFF, then press Continue to take "
                                      f"background frames at {len(exposures)} exposure time(s).")
         self.report(phase="background")

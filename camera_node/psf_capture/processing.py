@@ -32,7 +32,7 @@ import numpy as np
 from . import storage
 from .config import DIFFUSER_SENSOR_MM, PIXEL_PITCH_MM, SHIFT_SIGN_COL, SHIFT_SIGN_ROW
 
-VERSION = 1      # bump when the algorithm changes so old caches are not reused
+VERSION = 2      # bump when the algorithm changes so old caches are not reused
 
 DEFAULT_STEPS = {
     "background": "frames",
@@ -78,24 +78,40 @@ def phase_correlate(ref: np.ndarray, img: np.ndarray) -> tuple[float, float, flo
     return float(dy), float(dx), float(min(1.0, peak / perfect))
 
 
-def shift_image(img: np.ndarray, dy: float, dx: float) -> np.ndarray:
-    """Translate by (dy, dx) px with bilinear interpolation; uncovered pixels are NaN."""
-    h, w = img.shape
-
-    def axis(n, d):
-        src = np.arange(n) - d
+def sample(img: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+    """img evaluated at fractional source coordinates rows x cols (separable grid),
+    bilinear; pixels whose source lies outside the image are NaN."""
+    def axis(src, n):
         i0 = np.floor(src).astype(np.intp)
         f = (src - i0).astype(np.float32)
         ok = (src >= 0) & (src <= n - 1)
         return np.clip(i0, 0, n - 1), np.clip(i0 + 1, 0, n - 1), f, ok
 
-    r0, r1, fr, okr = axis(h, dy)
-    c0, c1, fc, okc = axis(w, dx)
+    r0, r1, fr, okr = axis(rows, img.shape[0])
+    c0, c1, fc, okc = axis(cols, img.shape[1])
     top = img[r0][:, c0] * (1 - fc) + img[r0][:, c1] * fc
     bot = img[r1][:, c0] * (1 - fc) + img[r1][:, c1] * fc
     out = top * (1 - fr)[:, None] + bot * fr[:, None]
     out[~(okr[:, None] & okc[None, :])] = np.nan
     return out.astype(np.float32)
+
+
+def shift_image(img: np.ndarray, dy: float, dx: float) -> np.ndarray:
+    """Translate by (dy, dx) px with bilinear interpolation; uncovered pixels are NaN."""
+    h, w = img.shape
+    return sample(img, np.arange(h) - dy, np.arange(w) - dx)
+
+
+def zoom_image(img: np.ndarray, factor: float) -> np.ndarray:
+    """Scale about the image centre (factor > 1 enlarges)."""
+    h, w = img.shape
+    ch, cw = (h - 1) / 2, (w - 1) / 2
+    return sample(img, (np.arange(h) - ch) / factor + ch, (np.arange(w) - cw) / factor + cw)
+
+
+def magnification(z_mm: float, d_mm: float = DIFFUSER_SENSOR_MM) -> float:
+    """Approximate PSF scale relative to a source at infinity."""
+    return 1 + d_mm / z_mm
 
 
 def sharpness(img: np.ndarray) -> float:
@@ -279,10 +295,19 @@ def _drift_with_z(psf, z_list, no_psf, x_mm, y_mm):
     valid = [i for i in range(len(z_list)) if not no_psf[i]]
     if len(valid) < 2:
         return [], None
+    def predicted(z):              # PSF position for the nominal x, y (axis at the sensor centre)
+        return SHIFT_SIGN_ROW * y_mm * shift_per_mm(z), SHIFT_SIGN_COL * x_mm * shift_per_mm(z)
+
     pos = {valid[0]: (0.0, 0.0)}
     for a, b in zip(valid, valid[1:]):
-        dy, dx, _ = phase_correlate(_bin2(psf[a]), _bin2(psf[b]))
-        pos[b] = (pos[a][0] + 2 * dy, pos[a][1] + 2 * dx)
+        # Undo the predicted change of scale first, otherwise neighbouring caustics
+        # decorrelate. Zooming about the centre also moves the PSF by (r - 1) * its
+        # position, which is removed using the predicted position.
+        r = magnification(z_list[a]) / magnification(z_list[b])
+        dy, dx, _ = phase_correlate(_bin2(psf[a]), _bin2(zoom_image(np.asarray(psf[b]), r)))
+        py, px = predicted(z_list[b])
+        step_y, step_x = 2 * dy - (r - 1) * py, 2 * dx - (r - 1) * px
+        pos[b] = (pos[a][0] + step_y, pos[a][1] + step_x)
     z0 = z_list[valid[0]]
     drift, zs, cx, cy = [], [], [], []
     for i in valid:

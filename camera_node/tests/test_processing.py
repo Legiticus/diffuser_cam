@@ -103,6 +103,9 @@ def test_rail_tilt_shows_up_as_source_drift(tmp_path):
     _, info = processing.load(process_session(d))
     assert info["rail_slope"]["x_mm_per_mm"] == pytest.approx(tilt, abs=0.002)
     assert abs(info["rail_slope"]["y_mm_per_mm"]) < 0.002
-    straight, _ = make_session(tmp_path, z=z, frames=1, seed=5, x=0.0)
+    # straight rail, off axis, coarse z steps (large scale change between planes)
+    straight, _ = make_session(tmp_path, z=(20.0, 40.0, 80.0, 160.0), frames=1, seed=5, x=3.0, y=-2.0)
     _, info2 = processing.load(process_session(straight))
     assert abs(info2["rail_slope"]["x_mm_per_mm"]) < 0.002
+    assert abs(info2["rail_slope"]["y_mm_per_mm"]) < 0.002
+    assert max(abs(d["source_dx_mm"]) for d in info2["drift"]) < 0.05
