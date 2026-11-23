@@ -1,0 +1,9 @@
+# picamera2 and numpy come from apt (python3-picamera2); create the venv with
+# --system-site-packages so they are visible. On a PC, `pip install numpy` too.
+fastapi
+uvicorn[standard]
+pyserial
+tifffile
+pillow
+pytest
+httpx

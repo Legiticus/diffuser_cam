@@ -1,0 +1,334 @@
+<!doctype html>
+<!--
+  PSF Capture frontend. One page, three tabs (Live, Capture, Model), Alpine.js (no build).
+  State comes from the backend over server-sent events (app.js); the backend enforces
+  all locking, the UI only reflects it.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PSF Capture</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js"></script>
+  <script defer src="/static/vendor/alpine.min.js"></script>
+</head>
+<body x-data="app()" x-init="init()">
+
+<header>
+  <div class="brand">PSF<span>Capture</span></div>
+  <nav>
+    <template x-for="t in ['live', 'capture', 'model']">
+      <button class="tab" :class="{active: tab === t}" @click="setTab(t)" x-text="t"></button>
+    </template>
+  </nav>
+  <div class="status">
+    <span x-show="s.fake && s.fake.length" class="pill muted" x-text="'simulated ' + (s.fake || []).join(' + ')"></span>
+    <span class="pill" :class="'st-' + s.state" x-text="stateLabel()"></span>
+    <span class="pill" :class="connected ? 'muted' : 'st-error'" x-text="connected ? 'connected' : 'reconnecting…'"></span>
+  </div>
+</header>
+
+<div class="banner error" x-show="s.state === 'error'">
+  <b>Error:</b> <span x-text="s.error"></span>
+  <button @click="post('/api/session/clear_error')">Clear</button>
+</div>
+<div class="banner" x-show="toast" x-text="toast" @click="toast = ''"></div>
+
+<!-- ============================ LIVE ============================ -->
+<main x-show="tab === 'live'" class="grid live">
+  <section class="panel video">
+    <h2>Live view <small>preview stream — never saved</small></h2>
+    <template x-if="tab === 'live'"><img src="/stream.mjpg" alt="live preview"></template>
+  </section>
+
+  <div class="side">
+    <section class="panel" :class="{locked: manualLocked()}">
+      <h2>Stage</h2>
+      <div class="readout">
+        <span>z</span>
+        <b x-text="s.homed && s.z_mm != null ? s.z_mm.toFixed(3) : '—'"></b><span>mm</span>
+      </div>
+      <p class="hint" x-show="!s.homed">Position unknown — home the stage first.</p>
+      <div class="row">
+        <button class="primary" @click="home()" :disabled="manualLocked()">Home</button>
+        <span class="hint" x-text="s.manual_busy || ''"></span>
+      </div>
+      <label>Go to z (mm)
+        <div class="row">
+          <input type="number" step="0.1" :min="d.z_range[0]" :max="d.z_range[1]" x-model.number="zTarget">
+          <button @click="moveTo(zTarget)" :disabled="manualLocked() || !s.homed">Go</button>
+        </div>
+      </label>
+      <div class="jog">
+        <template x-for="step in [-10, -1, -0.1, 0.1, 1, 10]">
+          <button @click="jog(step)" :disabled="manualLocked() || !s.homed" x-text="(step > 0 ? '+' : '') + step"></button>
+        </template>
+      </div>
+    </section>
+
+    <section class="panel" :class="{locked: manualLocked()}">
+      <h2>Exposure</h2>
+      <label>Exposure time (µs)
+        <input type="number" min="9" step="1" x-model.number="liveExposure">
+      </label>
+      <input type="range" min="0" max="1000" :value="expToSlider(liveExposure)"
+             @input="liveExposure = sliderToExp($event.target.value)">
+      <label>Analog gain
+        <input type="number" :min="d.gain_limits[0]" :max="d.gain_limits[1]" step="0.0625" x-model.number="liveGain">
+      </label>
+      <button class="primary" @click="applyControls()" :disabled="manualLocked()">Apply</button>
+      <p class="hint">Camera reports: <span x-text="stats.exposure_us ?? '—'"></span> µs, gain <span x-text="stats.gain ?? '—'"></span></p>
+    </section>
+
+    <section class="panel">
+      <h2>Histogram <small>raw 10-bit</small></h2>
+      <canvas x-ref="hist" width="320" height="120"></canvas>
+      <div class="kv">
+        <span>Saturated</span><b :class="{bad: stats.saturated_px > 0}"
+           x-text="stats.saturated_px == null ? '—' : stats.saturated_px + ' px (' + stats.saturated_pct.toFixed(3) + '%)'"></b>
+        <span>Peak / max</span><b x-text="(stats.peak ?? '—') + ' / ' + (stats.max ?? '—')"></b>
+        <span>Black level</span><b x-text="stats.black_level ?? '—'"></b>
+      </div>
+      <label class="check"><input type="checkbox" x-model="histLog"> log scale</label>
+    </section>
+  </div>
+</main>
+
+<!-- ============================ CAPTURE ============================ -->
+<main x-show="tab === 'capture'" class="grid capture">
+  <section class="panel" :class="{locked: s.state !== 'idle'}">
+    <h2>Session</h2>
+    <fieldset>
+      <legend>Source offset (required, set by hand)</legend>
+      <div class="cols2">
+        <label>x (mm, + right) <input type="number" step="0.1" x-model="form.x_mm" required></label>
+        <label>y (mm, + up) <input type="number" step="0.1" x-model="form.y_mm" required></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Z sampling plan</legend>
+      <label>Saved plan
+        <select x-model="form.plan_name" @change="loadPlan()">
+          <option value="">— custom —</option>
+          <template x-for="name in Object.keys(plans)"><option :value="name" x-text="name"></option></template>
+        </select>
+      </label>
+      <div class="cols2">
+        <label>z min (mm) <input type="number" step="0.1" :min="d.z_range[0]" :max="d.z_range[1]" x-model.number="form.z_min" @input="planEdited()"></label>
+        <label>z max (mm) <input type="number" step="0.1" :min="d.z_range[0]" :max="d.z_range[1]" x-model.number="form.z_max" @input="planEdited()"></label>
+        <label>Positions <input type="number" min="1" x-model.number="form.n_positions" @input="planEdited()"></label>
+        <label>Spacing
+          <select x-model="form.spacing" @change="planEdited()">
+            <option value="inverse">even in 1/z</option>
+            <option value="linear">linear in z</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <input type="text" placeholder="plan name" x-model="planName">
+        <button @click="savePlan()">Save plan</button>
+        <button x-show="form.plan_name" @click="deletePlan()">Delete</button>
+      </div>
+      <p class="hint" x-show="planPreview.actual_z">
+        <span x-text="(planPreview.actual_z || []).length"></span> positions,
+        spacing <span x-text="spacingText()"></span>
+      </p>
+      <template x-for="w in planPreview.warnings || []"><p class="warn" x-text="w"></p></template>
+      <p class="warn" x-show="planPreview.error" x-text="planPreview.error"></p>
+    </fieldset>
+
+    <details>
+      <summary>Measurement options</summary>
+      <div class="cols2">
+        <label>Frames per position <input type="number" min="1" x-model.number="form.frames_per_position"></label>
+        <label>Passes <input type="number" min="1" x-model.number="form.passes"></label>
+        <label>Settle time (s) <input type="number" min="0" step="0.1" x-model.number="form.settle_s"></label>
+        <label>Allowed saturated px <input type="number" min="0" x-model.number="form.allowed_saturated_px"></label>
+      </div>
+      <label class="check"><input type="checkbox" x-model="form.background"> Background (light-off) frames at every exposure used</label>
+      <label x-show="form.background">Background frames per exposure
+        <input type="number" min="1" :placeholder="form.frames_per_position" x-model.number="form.background_frames"></label>
+      <label>Exposure control
+        <select x-model="form.exposure_mode">
+          <option value="per_position">per position (automatic, gain fixed)</option>
+          <option value="fixed">fixed (Live tab exposure and gain)</option>
+        </select>
+      </label>
+      <div class="cols2" x-show="form.exposure_mode === 'per_position'">
+        <label>Target (fraction of range) <input type="number" min="0.05" max="0.99" step="0.05" x-model.number="form.target_fraction"></label>
+        <label>Max exposure (µs) <input type="number" min="9" :max="d.exposure_limits[1]" x-model.number="form.max_exposure_us"></label>
+        <label>No-PSF threshold (fraction) <input type="number" min="0" max="0.9" step="0.01" x-model.number="form.min_signal_fraction"></label>
+      </div>
+      <p class="hint">Gain <span x-text="s.live.gain"></span> and start exposure <span x-text="s.live.exposure_us"></span> µs come from the Live tab.</p>
+    </details>
+
+    <button class="primary big" @click="start()" :disabled="s.state !== 'idle' || s.manual_busy">Start session</button>
+  </section>
+
+  <section class="panel">
+    <h2>Progress</h2>
+    <div class="kv">
+      <span>State</span><b x-text="stateLabel()"></b>
+      <span>Session</span><b class="mono" x-text="s.session_id || '—'"></b>
+      <span>Phase</span><b x-text="p.phase || '—'"></b>
+      <span>Pass</span><b x-text="p.pass_no ? p.pass_no + ' / ' + p.passes : '—'"></b>
+      <span>Position</span><b x-text="p.positions_total ? (p.positions_done + ' / ' + p.positions_total) : '—'"></b>
+      <span>Current z</span><b x-text="s.z_mm != null ? s.z_mm.toFixed(3) + ' mm' : '—'"></b>
+      <span>Exposure</span><b x-text="p.exposure_us ? p.exposure_us + ' µs' : '—'"></b>
+      <span>Frames saved</span><b x-text="p.frames ?? '—'"></b>
+      <span>Time remaining</span><b x-text="eta()"></b>
+    </div>
+    <div class="bar"><div :style="'width:' + progressPct() + '%'"></div></div>
+    <div class="row">
+      <button @click="post('/api/session/pause', {paused: !s.paused})" :disabled="s.state !== 'capturing'" x-text="s.paused ? 'Resume' : 'Pause'"></button>
+      <button class="danger" @click="abort()" :disabled="!running()">Abort</button>
+    </div>
+    <h3>Warnings</h3>
+    <ul class="log">
+      <template x-for="w in s.warnings.slice().reverse()"><li x-text="w"></li></template>
+      <li class="hint" x-show="!s.warnings.length">none</li>
+    </ul>
+  </section>
+</main>
+
+<!-- ============================ MODEL ============================ -->
+<main x-show="tab === 'model'" class="grid model" :class="{locked: s.state !== 'idle'}">
+  <div class="lockmsg" x-show="s.state !== 'idle'">Locked while a measurement is in progress.</div>
+  <section class="panel">
+    <h2>Sessions <button class="small" @click="loadSessions()">refresh</button></h2>
+    <table class="sessions">
+      <thead><tr><th></th><th>Session</th><th>x</th><th>y</th><th>Plan</th><th>z</th><th>Passes</th><th>Status</th></tr></thead>
+      <tbody>
+        <template x-for="ses in sessions" :key="ses.id">
+          <tr>
+            <td><input type="checkbox" :value="ses.id" x-model="selected" :disabled="ses.status === 'running'"></td>
+            <td class="mono" x-text="ses.id.slice(0, 19)"></td>
+            <td x-text="ses.x_mm"></td><td x-text="ses.y_mm"></td>
+            <td x-text="ses.plan_name || 'custom'"></td>
+            <td x-text="ses.z_min + '–' + ses.z_max + ' (' + ses.n_positions + ', ' + ses.spacing + ')'"></td>
+            <td x-text="ses.passes"></td>
+            <td x-text="ses.status"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <p class="warn" x-show="selectedPlansDiffer()">The selected sessions used different z sampling plans.</p>
+
+    <h3>Processing</h3>
+    <div class="cols2">
+      <label>Background subtraction
+        <select x-model="steps.background">
+          <option value="frames">background frames</option>
+          <option value="black_level">black level only</option>
+          <option value="none">none</option>
+        </select>
+      </label>
+      <label>Normalization
+        <select x-model="steps.normalize">
+          <option value="exposure">÷ exposure × gain</option>
+          <option value="sum">sum to 1</option>
+          <option value="none">none</option>
+        </select>
+      </label>
+      <label>Combine passes
+        <select x-model="steps.combine"><option value="mean">mean</option><option value="median">median</option></select>
+      </label>
+      <label>Min quality (exclusion) <input type="number" min="0" max="1" step="0.05" x-model.number="steps.min_quality"></label>
+    </div>
+    <label class="check"><input type="checkbox" x-model="steps.average_frames"> Average frames per position</label>
+    <label class="check"><input type="checkbox" x-model="steps.register"> Register passes (subpixel phase correlation)</label>
+    <label class="check"><input type="checkbox" x-model="steps.exclude"> Exclude blurred / poorly correlated passes</label>
+    <button class="primary" @click="build()" :disabled="!selected.length || s.job.running || s.state !== 'idle'">Build model</button>
+    <div x-show="s.job.running || s.job.error">
+      <div class="bar"><div :style="'width:' + (100 * (s.job.progress || 0)) + '%'"></div></div>
+      <p class="hint" x-text="s.job.message"></p>
+      <p class="warn" x-show="s.job.error" x-text="s.job.error"></p>
+    </div>
+
+    <template x-if="built">
+      <div>
+        <h3>Model</h3>
+        <div class="kv">
+          <span>Sessions</span><b x-text="built.summary.sessions.length"></b>
+          <span>x range</span><b x-text="built.summary.x_range.join(' … ') + ' mm'"></b>
+          <span>y range</span><b x-text="built.summary.y_range.join(' … ') + ' mm'"></b>
+          <span>z range</span><b x-text="built.summary.z_range.map(v => v.toFixed(2)).join(' … ') + ' mm'"></b>
+          <span>Shift per mm</span><b x-text="built.summary.fitted_d_mm ? ('fitted, d ≈ ' + built.summary.fitted_d_mm.toFixed(3) + ' mm') : 'predicted with d = 2.3 mm (one offset)'"></b>
+        </div>
+        <template x-for="w in built.summary.warnings"><p class="warn" x-text="w"></p></template>
+        <template x-for="ses in built.sessions">
+          <div class="shiftplot">
+            <h4 x-text="ses.session"></h4>
+            <template x-for="w in ses.warnings"><p class="warn" x-text="w"></p></template>
+            <div x-show="ses.pass_shifts.length">
+              <p class="hint">Pass-to-pass shifts (px, relative to the mean of the passes) — random scatter means vibration.</p>
+              <div x-html="jitterPlot(ses)"></div>
+            </div>
+            <div x-show="ses.drift.length">
+              <p class="hint">PSF drift over the z range:
+                <b x-text="ses.drift_fit ? ses.drift_fit.drift_px.map(v => v.toFixed(1)).join(' / ') : '—'"></b> px (rows / cols).
+                Apparent source offset from the 1/z drift:
+                x <b x-text="ses.drift_fit ? ses.drift_fit.apparent_offset_mm.x_mm.toFixed(3) : '—'"></b>,
+                y <b x-text="ses.drift_fit ? ses.drift_fit.apparent_offset_mm.y_mm.toFixed(3) : '—'"></b> mm
+                (entered <span x-text="ses.x_mm + ', ' + ses.y_mm"></span>). On a straight rail through the entered
+                position the drift is ~0 on axis; an offset or a rail tilt cannot be told apart from the PSF alone.
+                Plot: correction to the source x/y at each z (implied minus entered).</p>
+              <div x-html="driftPlot(ses)"></div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </template>
+  </section>
+
+  <section class="panel">
+    <h2>Generate PSF</h2>
+    <table class="points">
+      <thead><tr><th>x (mm)</th><th>y (mm)</th><th>z (mm)</th><th>intensity</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="(pt, i) in points" :key="i">
+          <tr>
+            <td><input type="number" step="0.1" x-model.number="pt.x"></td>
+            <td><input type="number" step="0.1" x-model.number="pt.y"></td>
+            <td><input type="number" step="0.1" x-model.number="pt.z"></td>
+            <td><input type="number" step="0.1" x-model.number="pt.intensity"></td>
+            <td><button class="small" @click="points.splice(i, 1)">×</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <div class="row">
+      <button @click="points.push({x: 0, y: 0, z: 100, intensity: 1})">Add point</button>
+      <label class="file">Upload JSON<input type="file" accept=".json,application/json" @change="uploadPoints($event)"></label>
+      <button class="primary" @click="generate()" :disabled="!built || !points.length || s.state !== 'idle'">Generate</button>
+    </div>
+    <template x-for="w in result.warnings || []"><p class="warn" x-text="w"></p></template>
+    <template x-if="result.id">
+      <div>
+        <img class="result" :src="'/api/model/preview.png?gamma=' + gamma + '&id=' + result.id" alt="generated PSF">
+        <label>Display gamma <input type="range" min="1" max="4" step="0.5" x-model.number="gamma"></label>
+        <p class="hint">Sum <span x-text="result.sum.toPrecision(4)"></span>, max <span x-text="result.max.toPrecision(4)"></span>.
+          16-bit files are scaled by <span x-text="result.scale_16bit.toPrecision(6)"></span> (max → 65535).</p>
+        <div class="row">
+          <a class="button" href="/api/model/result.png" download>16-bit PNG</a>
+          <a class="button" href="/api/model/result.tiff" download>16-bit TIFF</a>
+          <a class="button" href="/api/model/result.npy" download>.npy (float32)</a>
+        </div>
+      </div>
+    </template>
+  </section>
+</main>
+
+<!-- Prompt shown whenever the backend waits for the user (e.g. turn the light off) -->
+<div class="modal" x-show="s.state === 'waiting_for_user' && s.prompt">
+  <div class="panel">
+    <h2>Action needed</h2>
+    <p x-text="s.prompt && s.prompt.message"></p>
+    <div class="row">
+      <button class="primary" @click="post('/api/session/continue')">Continue</button>
+      <button class="danger" @click="abort()">Abort session</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
