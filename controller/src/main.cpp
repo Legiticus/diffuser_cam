@@ -9,6 +9,12 @@ void zeroPosition();
 // Checks if the limit has been triggered
 bool limitTriggered(int pin);
 
+// Sends the current position over serial and shows it on the LCD
+void reportPosition();
+
+// Position is only known once the motor has been zeroed against L1
+bool positionKnown = false;
+
 // Initialize stepper motor and LCD display
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 LiquidCrystal lcd(RS,EN,D4,D5,D6,D7);
@@ -30,6 +36,9 @@ void setup() {
   stepper.setMaxSpeed(MAX_SPEED);
   stepper.setAcceleration(MAX_ACCL);
 
+  lcd.begin(16, 2);
+  reportPosition();
+
 }
 
 void loop() {
@@ -50,7 +59,9 @@ void loop() {
     if (strcmp(cmd, "ZERO") == 0) { // Zero laser position
 
       zeroPosition();
+      positionKnown = true;
       Serial.println("ZERO_SUCCESS");
+      reportPosition();
 
     }else if (strcmp(cmd, "MOVE") == 0) { // Move laser position
 
@@ -79,9 +90,11 @@ void loop() {
 
         // Print return msg
         if (success) Serial.println("MOVE_SUCCESS");
+        reportPosition();
 
       }else {
         Serial.println("MOVE_FAIL - No argument passed");
+        reportPosition();
       }
 
     }else {
@@ -134,6 +147,27 @@ void zeroPosition() {
   */
   stepper.setCurrentPosition(0);
 
+}
+
+void reportPosition() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Position:");
+  lcd.setCursor(0, 1);
+
+  if (!positionKnown) {
+    Serial.println("POSITION UNKNOWN");
+    lcd.print("UNKNOWN - ZERO");
+    return;
+  }
+
+  float position_mm = STEPPER_FORWARD * stepper.currentPosition() / (STEPS_PER_MM);
+
+  Serial.print("POSITION ");
+  Serial.println(position_mm, 3);
+
+  lcd.print(position_mm, 3);
+  lcd.print(" mm");
 }
 
 bool limitTriggered(int pin) {
