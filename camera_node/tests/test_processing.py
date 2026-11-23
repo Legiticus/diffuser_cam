@@ -96,16 +96,28 @@ def test_cache_is_reused_and_records_steps(tmp_path):
     assert processing.load(a)[1]["steps"]["combine"] == "median"
 
 
-def test_rail_tilt_shows_up_as_source_drift(tmp_path):
-    tilt = 0.01                                          # 1 mm sideways per 100 mm of z
-    z = (30.0, 40.0, 50.0, 60.0, 70.0)
-    d, _ = make_session(tmp_path, z=z, frames=1, source_x=lambda zz: tilt * (zz - 30.0))
-    _, info = processing.load(process_session(d))
-    assert info["rail_slope"]["x_mm_per_mm"] == pytest.approx(tilt, abs=0.002)
-    assert abs(info["rail_slope"]["y_mm_per_mm"]) < 0.002
-    # straight rail, off axis, coarse z steps (large scale change between planes)
-    straight, _ = make_session(tmp_path, z=(20.0, 40.0, 80.0, 160.0), frames=1, seed=5, x=3.0, y=-2.0)
-    _, info2 = processing.load(process_session(straight))
-    assert abs(info2["rail_slope"]["x_mm_per_mm"]) < 0.002
-    assert abs(info2["rail_slope"]["y_mm_per_mm"]) < 0.002
-    assert max(abs(d["source_dx_mm"]) for d in info2["drift"]) < 0.05
+def test_drift_with_z_gives_source_offset_corrections(tmp_path):
+    # even in 1/z; the PSF stays inside the sensor (a clipped PSF biases its centroid,
+    # which is used as the scaling centre)
+    z = tuple(float(v) for v in np.round(1 / np.linspace(1 / 30, 1 / 150, 10), 3))
+    # straight rail at the entered position: no correction needed
+    good, _ = make_session(tmp_path, z=z, frames=1, seed=5, x=2.0, y=-1.0)
+    _, info = processing.load(process_session(good))
+    assert info["drift_fit"]["apparent_offset_mm"]["x_mm"] == pytest.approx(2.0, abs=0.03)
+    assert info["drift_fit"]["apparent_offset_mm"]["y_mm"] == pytest.approx(-1.0, abs=0.03)
+    for d in info["drift"]:
+        assert abs(d["source_dx_mm"]) < 0.05 and abs(d["source_dy_mm"]) < 0.05
+    # entered (0, 0) but the source really sits at x = 1.2 mm: the PSF drifts with z
+    # and every plane reports a +1.2 mm correction
+    off, _ = make_session(tmp_path, z=z, frames=1, seed=6, x=0.0, source_x=lambda zz: 1.2)
+    _, info = processing.load(process_session(off))
+    assert abs(info["drift_fit"]["drift_px"][1]) == pytest.approx(1.2 * 2.3 / 0.003 * (1 / 30 - 1 / 150), rel=0.03)
+    assert info["drift_fit"]["offset_error_mm"]["x_mm"] == pytest.approx(1.2, abs=0.03)
+    for d in info["drift"]:
+        assert d["source_dx_mm"] == pytest.approx(1.2, abs=0.05)
+    # a kink in the rail shows up only at the z where it happens
+    kink, _ = make_session(tmp_path, z=z, frames=1, seed=7, x=0.0,
+                           source_x=lambda zz: 0.5 if zz == z[5] else 0.0)
+    _, info = processing.load(process_session(kink))
+    corr = {d["z_mm"]: d["source_dx_mm"] for d in info["drift"]}
+    assert corr[z[5]] - np.median(list(corr.values())) > 0.3

@@ -265,9 +265,14 @@
               <div x-html="jitterPlot(ses)"></div>
             </div>
             <div x-show="ses.drift.length">
-              <p class="hint">Source offset implied by PSF drift with z (mm, relative to the first plane).
-                Rail slope: x <b x-text="ses.rail_slope ? (ses.rail_slope.x_mm_per_mm * 100).toFixed(3) : '—'"></b>,
-                y <b x-text="ses.rail_slope ? (ses.rail_slope.y_mm_per_mm * 100).toFixed(3) : '—'"></b> mm per 100 mm.</p>
+              <p class="hint">PSF drift over the z range:
+                <b x-text="ses.drift_fit ? ses.drift_fit.drift_px.map(v => v.toFixed(1)).join(' / ') : '—'"></b> px (rows / cols).
+                Apparent source offset from the 1/z drift:
+                x <b x-text="ses.drift_fit ? ses.drift_fit.apparent_offset_mm.x_mm.toFixed(3) : '—'"></b>,
+                y <b x-text="ses.drift_fit ? ses.drift_fit.apparent_offset_mm.y_mm.toFixed(3) : '—'"></b> mm
+                (entered <span x-text="ses.x_mm + ', ' + ses.y_mm"></span>). On a straight rail through the entered
+                position the drift is ~0 on axis; an offset or a rail tilt cannot be told apart from the PSF alone.
+                Plot: correction to the source x/y at each z (implied minus entered).</p>
               <div x-html="driftPlot(ses)"></div>
             </div>
           </div>

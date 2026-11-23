@@ -184,7 +184,7 @@ def create_app(backend: Backend) -> FastAPI:
             infos = [processing.load(d)[1] for d in dirs]
             return {"summary": m.summary(), "sessions": [
                 {k: i[k] for k in ("session", "x_mm", "y_mm", "pass_shifts", "drift",
-                                   "rail_slope", "warnings", "units", "no_psf", "z_mm")}
+                                   "drift_fit", "warnings", "units", "no_psf", "z_mm")}
                 for i in infos]}
 
         b.run_job(job)

@@ -12,7 +12,8 @@ Steps (each optional, in order):
                  "sum": each plane sums to 1;  "none": counts at the first pass's exposure
 
 Results are cached in <session>/processed/<key>/ (psf.npy: float32 [n_z, h, w], NaN =
-invalid; info.json: steps used, measured pass shifts, drift with z). Passes are
+invalid; info.json: steps used, measured pass shifts, drift with z and the source
+offset it implies). Passes are
 always brought to a common exposure before combining because per-position exposure
 may differ between passes.
 
@@ -32,7 +33,7 @@ import numpy as np
 from . import storage
 from .config import DIFFUSER_SENSOR_MM, PIXEL_PITCH_MM, SHIFT_SIGN_COL, SHIFT_SIGN_ROW
 
-VERSION = 2      # bump when the algorithm changes so old caches are not reused
+VERSION = 3      # bump when the algorithm changes so old caches are not reused
 
 DEFAULT_STEPS = {
     "background": "frames",
@@ -102,10 +103,10 @@ def shift_image(img: np.ndarray, dy: float, dx: float) -> np.ndarray:
     return sample(img, np.arange(h) - dy, np.arange(w) - dx)
 
 
-def zoom_image(img: np.ndarray, factor: float) -> np.ndarray:
-    """Scale about the image centre (factor > 1 enlarges)."""
+def zoom_image(img: np.ndarray, factor: float, center=None) -> np.ndarray:
+    """Scale about `center` (row, col; default the image centre); factor > 1 enlarges."""
     h, w = img.shape
-    ch, cw = (h - 1) / 2, (w - 1) / 2
+    ch, cw = center if center is not None else ((h - 1) / 2, (w - 1) / 2)
     return sample(img, (np.arange(h) - ch) / factor + ch, (np.arange(w) - cw) / factor + cw)
 
 
@@ -207,7 +208,7 @@ def process_session(session_dir: Path, steps: dict | None = None, progress=None)
 
     if progress:
         progress(1.0, f"{session_dir.name}: drift")
-    drift, slope = _drift_with_z(psf, z_list, no_psf, meta["x_mm"], meta["y_mm"])
+    drift, drift_fit = _drift_with_z(psf, z_list, no_psf, meta["x_mm"], meta["y_mm"])
     info = {
         "session": session_dir.name, "steps": steps, "processing_version": VERSION,
         "created": datetime.now().isoformat(timespec="seconds"),
@@ -216,7 +217,7 @@ def process_session(session_dir: Path, steps: dict | None = None, progress=None)
         "units": {"exposure": "counts / (us * gain)", "sum": "fraction of total",
                   "none": f"counts at {ref_scale:.0f} us*gain"}[steps["normalize"]],
         "invalid": "NaN pixels in psf.npy have no data (outside the sensor after registration)",
-        "pass_shifts": shifts, "drift": drift, "rail_slope": slope, "warnings": warnings,
+        "pass_shifts": shifts, "drift": drift, "drift_fit": drift_fit, "warnings": warnings,
     }
     storage.write_json(out / "info.json", info)
     return out
@@ -289,40 +290,60 @@ def _combine_passes(passes: list[tuple[int, np.ndarray]], steps: dict):
 
 
 def _drift_with_z(psf, z_list, no_psf, x_mm, y_mm):
-    """Where the PSF sits at each z relative to the first plane (chained neighbour
-    registration), and the source offset that would explain what a pure 1/z shift
-    from the nominal x, y does not. On axis a steady drift means the rail is tilted."""
+    """How the PSF moves with z, and what that says about the source position.
+
+    A source at lateral offset x shifts the PSF by SIGN * x * d / (z * pitch), and the
+    pixel of the optical axis is unknown, so the PSF position follows c + B / z.
+    B gives the apparent source offset (a constant misplacement and a rail tilt look
+    the same here, so only this effective offset is measurable). Per z, the source
+    position implied by the measured PSF position minus the entered x, y is the
+    correction for that z; on a straight rail it is the same at every z."""
     valid = [i for i in range(len(z_list)) if not no_psf[i]]
     if len(valid) < 2:
         return [], None
-    def predicted(z):              # PSF position for the nominal x, y (axis at the sensor centre)
-        return SHIFT_SIGN_ROW * y_mm * shift_per_mm(z), SHIFT_SIGN_COL * x_mm * shift_per_mm(z)
-
-    pos = {valid[0]: (0.0, 0.0)}
+    pos = {valid[0]: (0.0, 0.0)}                    # PSF position relative to the first plane
     for a, b in zip(valid, valid[1:]):
-        # Undo the predicted change of scale first, otherwise neighbouring caustics
-        # decorrelate. Zooming about the centre also moves the PSF by (r - 1) * its
-        # position, which is removed using the predicted position.
+        # Undo the predicted change of scale (~1 + d/z) first, otherwise neighbouring
+        # caustics decorrelate. Zoom about the centre of the PSF's footprint (the
+        # scaling centre) so the zoom itself does not move the PSF. A PSF clipped by
+        # the sensor edge biases that centre and with it the apparent offset.
         r = magnification(z_list[a]) / magnification(z_list[b])
-        dy, dx, _ = phase_correlate(_bin2(psf[a]), _bin2(zoom_image(np.asarray(psf[b]), r)))
-        py, px = predicted(z_list[b])
-        step_y, step_x = 2 * dy - (r - 1) * py, 2 * dx - (r - 1) * px
-        pos[b] = (pos[a][0] + step_y, pos[a][1] + step_x)
-    z0 = z_list[valid[0]]
-    drift, zs, cx, cy = [], [], [], []
-    for i in valid:
-        z = z_list[i]
-        exp_row = SHIFT_SIGN_ROW * y_mm * (shift_per_mm(z) - shift_per_mm(z0))
-        exp_col = SHIFT_SIGN_COL * x_mm * (shift_per_mm(z) - shift_per_mm(z0))
-        dy, dx = pos[i]
-        src_dx = (dx - exp_col) / (SHIFT_SIGN_COL * shift_per_mm(z))
-        src_dy = (dy - exp_row) / (SHIFT_SIGN_ROW * shift_per_mm(z))
-        drift.append({"z_index": i, "z_mm": z, "dy_px": dy, "dx_px": dx,
-                      "source_dx_mm": src_dx, "source_dy_mm": src_dy})
-        zs.append(z), cx.append(src_dx), cy.append(src_dy)
-    slope = {"x_mm_per_mm": float(np.polyfit(zs, cx, 1)[0]),
-             "y_mm_per_mm": float(np.polyfit(zs, cy, 1)[0])}
-    return drift, slope
+        plane = np.asarray(psf[b])
+        dy, dx, _ = phase_correlate(_bin2(psf[a]), _bin2(zoom_image(plane, r, _support_center(plane))))
+        pos[b] = (pos[a][0] + 2 * dy, pos[a][1] + 2 * dx)
+
+    zs = np.array([z_list[i] for i in valid])
+    rows = np.array([pos[i][0] for i in valid])
+    cols = np.array([pos[i][1] for i in valid])
+    design = np.stack([np.ones_like(zs), 1 / zs], axis=1)
+    (c_row, b_row), *_ = np.linalg.lstsq(design, rows, rcond=None)
+    (c_col, b_col), *_ = np.linalg.lstsq(design, cols, rcond=None)
+    k = shift_per_mm(1.0)                           # px per mm at z = 1 mm (k(z) = k / z)
+    apparent = {"x_mm": float(b_col / (SHIFT_SIGN_COL * k)), "y_mm": float(b_row / (SHIFT_SIGN_ROW * k))}
+    drift = []
+    for i, z, r_px, c_px in zip(valid, zs, rows, cols):
+        drift.append({"z_index": i, "z_mm": float(z), "dy_px": float(r_px), "dx_px": float(c_px),
+                      "source_dx_mm": float((c_px - c_col) / (SHIFT_SIGN_COL * k / z) - x_mm),
+                      "source_dy_mm": float((r_px - c_row) / (SHIFT_SIGN_ROW * k / z) - y_mm)})
+    fit_rms = float(np.sqrt(np.mean((rows - design @ [c_row, b_row]) ** 2
+                                    + (cols - design @ [c_col, b_col]) ** 2)))
+    summary = {"apparent_offset_mm": apparent,
+               "offset_error_mm": {"x_mm": apparent["x_mm"] - x_mm, "y_mm": apparent["y_mm"] - y_mm},
+               "drift_px": [float(rows[-1] - rows[0]), float(cols[-1] - cols[0])],
+               "fit_rms_px": fit_rms}
+    return drift, summary
+
+
+def _support_center(img: np.ndarray, block: int = 16) -> tuple[float, float]:
+    """Centre (row, col) of the area the PSF covers: the projected diffuser aperture,
+    which scales about the source's projection. Uses a block-averaged image thresholded
+    at 30 % of its maximum, so the caustic detail inside does not bias it."""
+    h, w = img.shape
+    hb, wb = h // block, w // block
+    small = np.nan_to_num(img[: hb * block, : wb * block]).reshape(hb, block, wb, block).mean(axis=(1, 3))
+    mask = small > 0.3 * small.max() if small.max() > 0 else np.ones_like(small, bool)
+    rr, cc = np.nonzero(mask)
+    return (rr.mean() + 0.5) * block - 0.5, (cc.mean() + 0.5) * block - 0.5
 
 
 def _bin2(img: np.ndarray) -> np.ndarray:

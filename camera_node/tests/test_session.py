@@ -100,6 +100,6 @@ def test_requires_xy_and_valid_range(backend):
 
 def test_exposure_ladder():
     ladder = exposure_ladder(9, 100000)
-    assert ladder[0] >= 9 and ladder[-1] == 100000
-    ratios = [b / a for a, b in zip(ladder, ladder[1:-1])]
+    assert ladder[0] == 9 and ladder[-1] == 100000
+    ratios = [b / a for a, b in zip(ladder[1:], ladder[2:-1])]
     assert all(1.3 < r < 1.5 for r in ratios)

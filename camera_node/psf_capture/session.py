@@ -26,7 +26,7 @@ MAX_RETAKES = 6
 
 
 def exposure_ladder(lo: int, hi: int) -> list[int]:
-    """Allowed per-position exposures: EXPOSURE_STEPS_PER_OCTAVE per doubling, plus hi."""
+    """Allowed per-position exposures: EXPOSURE_STEPS_PER_OCTAVE per doubling, plus lo and hi."""
     k0 = math.ceil(EXPOSURE_STEPS_PER_OCTAVE * math.log2(max(lo, 1)))
     rungs = set()
     k = k0
@@ -34,7 +34,7 @@ def exposure_ladder(lo: int, hi: int) -> list[int]:
         if e >= lo:
             rungs.add(e)
         k += 1
-    rungs.add(int(hi))
+    rungs.update((int(lo), int(hi)))
     return sorted(rungs)
 
 

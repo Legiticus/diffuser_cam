@@ -200,12 +200,21 @@ reuses the cache.
    exposure first.
    - The measured shifts appear as plots. Random scatter between passes
      means vibration.
-   - **Drift with z.** The PSFs of neighbouring z planes are registered after
-     rescaling each plane by the predicted magnification ratio (1 + d/z). The
-     part of the drift that the nominal x/y does not explain is converted into
-     a source x/y correction for each z, relative to the first plane, and a
-     rail slope is fitted to it. On axis, a steady drift means the rail is
-     tilted.
+   - **Drift with z.** Neighbouring z planes are registered to each other.
+     Before each registration the plane is rescaled by the predicted
+     magnification ratio (1 + d/z), about the centre of the PSF's footprint.
+     A lateral source offset x shifts the PSF by x·d/(z·pitch), and the
+     axis pixel is unknown, so the PSF positions are fitted with c + B/z.
+     B is reported as the **apparent source offset**, next to the x/y you
+     entered. For each z, the source position implied by the measured PSF
+     position, minus the entered x/y, is saved as that plane's
+     **correction to the source x/y**. On a straight rail at the entered
+     position the corrections are about 0, and on axis the PSF does not
+     drift. A steady drift means the source line is off axis, either
+     because the source was misplaced or because the rail is tilted; the
+     PSF alone cannot tell these apart. A kink in the rail shows up as a
+     correction at that z only. A PSF clipped by the sensor edge biases
+     its footprint centre, and with it these numbers.
 4. **Normalisation.** Divides by exposure × gain (counts per µs per unit
    gain, which keeps the real fall-off of brightness with distance), scales
    each plane to sum to 1, or leaves the data in counts at the first pass's
@@ -288,5 +297,5 @@ protocol, including step truncation and the limit switch.
 
 The processing tests use synthetic data with known answers. For example, they
 apply a known subpixel shift and check that it is recovered within 0.05 px, put
-jitter on the passes and check that it is undone, and tilt the rail and check
-that the slope is detected.
+jitter on the passes and check that it is undone, and misplace the source or
+kink the rail and check that the per-z corrections show it.
