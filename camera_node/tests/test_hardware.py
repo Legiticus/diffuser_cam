@@ -51,5 +51,6 @@ def test_stage_home_move_and_homing_check(stage):
     assert stage.z == config.Z_HOME_MM
     assert stage.move_to_z(30.0) == 30.0
     assert stage.move_to_z(25.5) == 25.5                 # approached from below
-    result = stage.check_home()
-    assert not result["steps_lost"], result
+    baseline = stage.probe_switch()
+    stage.move_to_z(200.0)
+    assert abs(stage.probe_switch() - baseline) < config.HOME_TOLERANCE_MM

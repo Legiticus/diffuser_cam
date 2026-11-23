@@ -65,15 +65,15 @@ def test_software_limits_and_unknown_position():
         stage.move_to_z(Z_HOME_MM - 0.1)
 
 
-def test_check_home_detects_lost_steps():
+def test_switch_probe_detects_lost_steps():
     stage, fw = make_stage()
-    stage.move_to_z(300)
-    ok = stage.check_home()
-    assert not ok["steps_lost"] and abs(ok["trigger_position_mm"]) < 0.05
+    baseline = stage.probe_switch()
+    assert baseline == pytest.approx(fw.HOME_BACKOFF / STEPS_PER_MM)   # switch hysteresis
     assert stage.z == Z_HOME_MM
+    stage.move_to_z(300)
+    assert stage.probe_switch() == pytest.approx(baseline)             # nothing lost
 
     fw.lose_steps = 100                    # every move travels 100 steps short
     for z in [100, 200, 300]:
         stage.move_to_z(z)
-    bad = stage.check_home()
-    assert bad["steps_lost"]
+    assert abs(stage.probe_switch() - baseline) > 0.05

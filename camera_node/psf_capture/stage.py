@@ -23,7 +23,7 @@ from collections import deque
 import numpy as np
 
 from . import coords
-from .config import (BACKLASH_MM, BAUD, HOME_TOLERANCE_MM, STAGE_SPEED_MM_S,
+from .config import (BACKLASH_MM, BAUD, STAGE_SPEED_MM_S,
                      STEPS_PER_MM, Z_HOME_MM, Z_MAX_MM)
 
 log = logging.getLogger(__name__)
@@ -77,9 +77,11 @@ class Stage:
                 self._move_steps(target)
             return self.z
 
-    def check_home(self) -> dict:
-        """Drive slowly into the front switch, record where it triggers (slider mm,
-        ideally ~0) and re-home. A trigger far from 0 means steps were lost."""
+    def probe_switch(self) -> float | None:
+        """Creep into the front switch from z = 11 mm, return the slider position (mm)
+        where it triggers, then re-home. The switch presses ~0.7 mm past the firmware's
+        zero (which is where it releases), so compare against a baseline probe taken
+        right after homing: a change means steps were lost. None = never triggered."""
         with self._lock:
             if self.steps is None:
                 raise StageError("Position unknown: home the stage first")
@@ -91,9 +93,7 @@ class Stage:
             except LimitHit as e:
                 trigger_mm = e.slider_mm
             self._home()
-            lost = trigger_mm is None or abs(trigger_mm) > HOME_TOLERANCE_MM
-            return {"trigger_position_mm": trigger_mm, "tolerance_mm": HOME_TOLERANCE_MM,
-                    "steps_lost": lost}
+            return trigger_mm
 
     def close(self) -> None:
         self.port.close()
@@ -101,7 +101,7 @@ class Stage:
     # --- protocol -----------------------------------------------------------
     def _home(self) -> None:
         self.steps = None
-        status, pos = self._command("ZERO", timeout=30 + 2 * Z_MAX_MM / STAGE_SPEED_MM_S)
+        status, pos = self._command("ZERO", timeout=30 + 1.5 * Z_MAX_MM / STAGE_SPEED_MM_S)
         if status != "ZERO_SUCCESS" or pos is None or coords.slider_mm_to_steps(pos) != 0:
             raise StageError(f"Homing failed: {status} / position {pos}")
         self.steps = 0
@@ -115,7 +115,7 @@ class Stage:
         # Firmware: steps = trunc(800.0 * arg). Bias by half a step so float error
         # can never round it down by one.
         arg = coords.steps_to_slider_mm(delta + (0.5 if delta > 0 else -0.5))
-        timeout = 10 + 2 * abs(delta) / STEPS_PER_MM / STAGE_SPEED_MM_S
+        timeout = 10 + 1.5 * abs(delta) / STEPS_PER_MM / STAGE_SPEED_MM_S
         status, pos = self._command(f"MOVE {arg:.6f}", timeout)
         self.steps = None if pos is None else coords.slider_mm_to_steps(pos)
         if status.startswith("MOVE_FAIL") and "Front Limit" in status and pos is not None:
@@ -162,7 +162,8 @@ class FakeArduino:
     `lose_steps` adds that many steps of error to every move to simulate stalls.
     `speed_scale` scales simulated travel time (0 = instant)."""
 
-    HOME_BACKOFF = 8                        # ZERO backs off 0.01 mm steps until the switch releases
+    HOME_BACKOFF = 536                      # switch hysteresis: ZERO ends where it releases, ~0.67 mm
+                                            # behind the point where it presses (measured on the rig)
 
     def __init__(self, start_mm: float = 100.0, speed_scale: float = 0.0, lose_steps: int = 0):
         self.true_steps = round(start_mm * STEPS_PER_MM)

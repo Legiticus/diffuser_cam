@@ -38,6 +38,7 @@ def test_full_session_writes_frames_metadata_and_backgrounds(backend):
     bg = storage.read_frame(d / m["backgrounds"][0]["file"])
     assert bg.mean() < 80
     assert not m["homing_check"]["steps_lost"]
+    assert m["homing_check"]["offset_mm"] == 0 and m["homing_baseline_mm"] > 0
     assert m["app"]["version"]
 
 

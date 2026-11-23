@@ -5,7 +5,8 @@ Flow (runs in the backend's capture thread):
   2. home the stage (the front switch is the only reference)
   3. for each pass, for each planned z: move (always arriving from below), settle,
      choose the exposure, take the frames, write each one immediately
-  4. end-of-session homing check (where the switch triggers; != 0 => lost steps)
+  4. end-of-session homing check: where the switch triggers, compared with a probe
+     taken right after the initial homing (a difference means steps were lost)
   5. background: prompt light off, frames at every exposure used, prompt light on
 Raw frames are stored unchanged; all corrections happen later in processing.py.
 """
@@ -18,7 +19,8 @@ from datetime import datetime
 
 from . import plans, storage
 from .camera import robust_peak
-from .config import BACKLASH_MM, EXPOSURE_STEPS_PER_OCTAVE, SATURATION, Z_HOME_MM
+from .config import (BACKLASH_MM, EXPOSURE_STEPS_PER_OCTAVE, HOME_TOLERANCE_MM, SATURATION,
+                     Z_HOME_MM)
 
 MAX_RETAKES = 6
 
@@ -139,6 +141,8 @@ class CaptureSession:
 
         self.report(phase="homing")
         self.b.stage.home()
+        self.meta["homing_baseline_mm"] = self.b.stage.probe_switch()   # where the switch presses now
+        self.save()
         self.t_sweep = time.monotonic()
         for pass_no in range(1, o["passes"] + 1):
             if pass_no > 1 and self.plan["actual_z"][0] - BACKLASH_MM < Z_HOME_MM:
@@ -154,13 +158,20 @@ class CaptureSession:
         self.report(phase="done", eta_s=0)
 
     def homing_check(self, when: str) -> None:
-        result = {"when": when, **self.b.stage.check_home()}
+        """Probe the switch again; if it now triggers at a different slider position
+        than at the start of the session, steps were lost (the stepper is open loop)."""
+        trigger = self.b.stage.probe_switch()
+        baseline = self.meta["homing_baseline_mm"]
+        offset = None if trigger is None or baseline is None else round(trigger - baseline, 4)
+        result = {"when": when, "trigger_position_mm": trigger, "baseline_mm": baseline,
+                  "offset_mm": offset, "tolerance_mm": HOME_TOLERANCE_MM,
+                  "steps_lost": offset is None or abs(offset) > HOME_TOLERANCE_MM}
         self.meta["homing_checks"].append(result)
         self.meta["homing_check"] = result                 # the latest (end of session) result
         self.save()
         if result["steps_lost"]:
-            self.warn(f"Homing check {when}: limit switch triggered at "
-                      f"{result['trigger_position_mm']} mm instead of 0, steps were lost")
+            self.warn(f"Homing check {when}: limit switch triggered {offset} mm away from where "
+                      f"it triggered at the start of the session (steps were lost)")
 
     def capture_position(self, pass_no: int, i: int, z: float) -> None:
         o, cam = self.opt, self.b.camera

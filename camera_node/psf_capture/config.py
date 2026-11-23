@@ -23,8 +23,8 @@ Z_HOME_MM = 10.0              # source-to-diffuser distance when the front limit
 Z_MAX_MM = 340.0              # software far travel limit (there is no back switch)
 BACKLASH_MM = 1.0             # positions are approached from below z by at least this much
 MIN_SPACING_STEPS = 4         # warn if planned positions are closer than this
-HOME_TOLERANCE_MM = 0.05      # end-of-session limit trigger further than this from 0 => steps lost
-STAGE_SPEED_MM_S = 16.0       # firmware max speed; used only to size serial timeouts
+HOME_TOLERANCE_MM = 0.05      # switch trigger moved more than this since the session start => steps lost
+STAGE_SPEED_MM_S = 5.0        # measured travel speed (firmware loop limits it below its 16 mm/s setting)
 
 # --- Sensor -----------------------------------------------------------------
 SENSOR_MODEL = "OV9281"
