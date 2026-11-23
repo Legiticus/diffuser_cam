@@ -1,6 +1,5 @@
 """Shared fixtures: a Backend wired to the fake stage and fake camera in a temp data dir."""
 
-import threading
 import time
 
 import pytest
