@@ -22,7 +22,7 @@ def client(backend):
 def test_frontend_and_status(client):
     assert "alpine" in client.get("/").text.lower()
     s = client.get("/api/status").json()
-    assert s["state"] == "idle" and s["fake"] and not s["homed"]
+    assert s["state"] == "idle" and s["fake"] == ["camera", "stage"] and not s["homed"]
     d = client.get("/api/defaults").json()
     assert d["options"]["n_positions"] == 64 and d["options"]["spacing"] == "inverse"
     assert d["options"]["frames_per_position"] == 5 and d["options"]["background"] is True

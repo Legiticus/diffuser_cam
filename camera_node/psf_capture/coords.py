@@ -15,12 +15,12 @@ def z_to_steps(z_mm: float) -> int:
 
 
 def steps_to_z(steps: int) -> float:
-    return Z_HOME_MM + steps / STEPS_PER_MM
+    return round(Z_HOME_MM + steps / STEPS_PER_MM, 6)
 
 
 def round_z(z_mm: float) -> float:
     """z as actually reachable by the motor."""
-    return steps_to_z(z_to_steps(z_mm))
+    return round(steps_to_z(z_to_steps(z_mm)), 6)
 
 
 def steps_to_slider_mm(steps: float) -> float:

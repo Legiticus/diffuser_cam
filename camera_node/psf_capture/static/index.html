@@ -22,7 +22,7 @@
     </template>
   </nav>
   <div class="status">
-    <span x-show="s.fake" class="pill muted">simulated hardware</span>
+    <span x-show="s.fake && s.fake.length" class="pill muted" x-text="'simulated ' + (s.fake || []).join(' + ')"></span>
     <span class="pill" :class="'st-' + s.state" x-text="stateLabel()"></span>
     <span class="pill" :class="connected ? 'muted' : 'st-error'" x-text="connected ? 'connected' : 'reconnecting…'"></span>
   </div>

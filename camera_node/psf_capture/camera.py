@@ -81,7 +81,6 @@ class RealCamera:
     def __init__(self, exposure_us: int, gain: float):
         from picamera2 import Picamera2
         self.picam2 = Picamera2()
-        self.exposure_limits = (EXPOSURE_LIMITS_US[0], self.picam2.camera_controls["ExposureTime"][1])
         self.exposure_us, self.gain = clamp_controls(exposure_us, gain)
         cfg = self.picam2.create_video_configuration(
             main={"size": PREVIEW_SIZE, "format": "YUV420"},     # preview only
@@ -90,6 +89,9 @@ class RealCamera:
             controls={"AeEnable": False, **self._controls()},
         )
         self.picam2.configure(cfg)
+        # Only valid after configure() (before, the limit follows the default frame rate).
+        self.exposure_limits = tuple(int(v) for v in self.picam2.camera_controls["ExposureTime"][:2])
+        self.gain_limits = tuple(float(v) for v in self.picam2.camera_controls["AnalogueGain"][:2])
         self.black_level = 0
         self._cond = threading.Condition()
         self._latest: Frame | None = None

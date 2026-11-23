@@ -61,7 +61,9 @@ class Backend:
                 "warnings": self.warnings[-50:], "session_id": self.session_id,
                 "z_mm": self.stage.z, "homed": self.stage.steps is not None,
                 "manual_busy": self.manual_busy, "live": self.live, "job": self.job,
-                "fake": self.world is not None,
+                "fake": [name for name, fake in (("camera", self.world is not None),
+                                                 ("stage", type(self.stage.port).__name__ == "FakeArduino"))
+                         if fake],
             }
 
     def changed(self, **fields) -> None:
