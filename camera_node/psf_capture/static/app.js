@@ -22,7 +22,7 @@ function app() {
     plans: {}, planName: '', planPreview: {},
 
     // model
-    sessions: [], selected: [], steps: {}, built: null,
+    sessions: [], selected: [], steps: {}, built: null, builtId: null,
     points: [{x: 0, y: 0, z: 100, intensity: 1}], result: {}, gamma: 2,
 
     get p() { return this.s.progress || {}; },
@@ -42,7 +42,7 @@ function app() {
       this.liveExposure = o.exposure_us;
       this.liveGain = o.gain;
       this.s = await this.get('/api/status');
-      if (this.s.job && this.s.job.result) this.built = this.s.job.result;
+      this.takeResult();
       this.plans = await this.get('/api/plans');
       this.connect();
       this.previewPlan();
@@ -57,7 +57,7 @@ function app() {
       es.onmessage = (ev) => {
         const prev = this.s;
         this.s = JSON.parse(ev.data);
-        if (this.s.job && this.s.job.result && prev.job && prev.job.running) this.built = this.s.job.result;
+        this.takeResult();
         if (prev.state !== 'idle' && this.s.state === 'idle') this.loadSessions();
       };
     },
@@ -189,7 +189,18 @@ function app() {
       const key = (s) => [s.z_min, s.z_max, s.n_positions, s.spacing].join();
       return new Set(this.sessions.filter(s => this.selected.includes(s.id)).map(key)).size > 1;
     },
-    build() { this.built = null; this.post('/api/model/build', {sessions: this.selected, steps: this.steps}).catch(() => {}); },
+    // Show a finished build's result once, keyed by job id. A build can start and finish
+    // between two server-sent events (e.g. when processing is cached), so the frontend may
+    // never see `running: true`; the id still tells it that this result is new.
+    takeResult() {
+      const j = this.s.job || {};
+      if (j.result && j.id !== this.builtId) { this.built = j.result; this.builtId = j.id; }
+    },
+    async build() {
+      this.built = null;
+      const snap = await this.post('/api/model/build', {sessions: this.selected, steps: this.steps}).catch(() => null);
+      if (snap && (!this.s.version || snap.version >= this.s.version)) { this.s = snap; this.takeResult(); }
+    },
     async generate() {
       const pts = this.points.map(p => ({x: +p.x, y: +p.y, z: +p.z, intensity: p.intensity === '' ? 1 : +p.intensity}));
       this.result = await this.post('/api/model/generate', {points: pts}).catch(() => ({}));
