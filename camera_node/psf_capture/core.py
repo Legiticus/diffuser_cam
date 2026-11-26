@@ -47,7 +47,9 @@ class Backend:
         self.warnings: list[str] = []
         self.session_id: str | None = None
         self.manual_busy: str | None = None      # e.g. "homing", while a manual command runs
-        self.job: dict = {"running": False}      # model building progress
+        # Model building progress. The id goes up by one per build and starts from the clock,
+        # so it never repeats across a server restart while a page stays open.
+        self.job: dict = {"id": int(time.time() * 1000), "running": False}
         self._abort = threading.Event()
         self._continue = threading.Event()
         self._thread: threading.Thread | None = None
@@ -211,7 +213,8 @@ class Backend:
             self.require_idle_for_model()
             if self.job["running"] or self.manual_busy:
                 raise Busy("Busy")
-            self.job = {"running": True, "progress": 0.0, "message": "starting", "error": None}
+            job_id = self.job.get("id", 0) + 1
+            self.job = {"id": job_id, "running": True, "progress": 0.0, "message": "starting", "error": None}
         self.changed()
 
         def report(fraction: float, message: str):
@@ -220,11 +223,11 @@ class Backend:
         def work():
             try:
                 result = fn(report)
-                self.changed(job={"running": False, "progress": 1.0, "message": "done",
+                self.changed(job={"id": job_id, "running": False, "progress": 1.0, "message": "done",
                                   "error": None, "result": result})
             except Exception as e:
                 log.exception("job failed")
-                self.changed(job={"running": False, "progress": 0.0, "message": "failed",
+                self.changed(job={"id": job_id, "running": False, "progress": 0.0, "message": "failed",
                                   "error": f"{type(e).__name__}: {e}"})
         threading.Thread(target=work, name="job", daemon=True).start()
 

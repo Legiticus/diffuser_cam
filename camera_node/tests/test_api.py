@@ -102,3 +102,17 @@ def test_sse_pushes_snapshots(client, backend):
             if line.startswith("data:"):
                 assert json.loads(line[5:])["state"] == "idle"
                 break
+
+
+def test_each_build_has_a_new_job_id(client, backend):
+    """A build can finish between two SSE snapshots (cached processing), so the frontend
+    never sees `running: true`. The job id is how it tells that a result is new."""
+    ids = []
+    for n in range(2):
+        snap = client.get("/api/status").json()
+        backend.run_job(lambda report, n=n: {"build": n})       # finishes immediately
+        wait_for(lambda: not backend.job["running"])
+        job = client.get("/api/status").json()["job"]
+        assert job["id"] > snap["job"]["id"] and job["result"] == {"build": n}
+        ids.append(job["id"])
+    assert ids[1] == ids[0] + 1
